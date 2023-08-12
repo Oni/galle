@@ -1,4 +1,4 @@
-FROM python:python:3.8.17-alpine3.18
+FROM python:3.8.17-alpine3.18
 
 ADD galle.py /usr/app
 
