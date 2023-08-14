@@ -322,7 +322,7 @@ class UndecidedFilterState(ProxyState):
         LOG.debug(
             '[%s] Received from downstream (buffering): "%s"',
             self.model.uuid,
-            downstream_line.decode("utf-8"),
+            decode_data_for_logging(downstream_line),
         )
 
         self.model.buffered_lines.append(downstream_line)
@@ -400,7 +400,7 @@ class FilterPassState(ProxyState):
         LOG.debug(
             '[%s] Received from downstream and proxying upstream: "%s"',
             self.model.uuid,
-            downstream_data.decode("utf-8"),
+            decode_data_for_logging(downstream_data),
         )
 
         if downstream_data != b"":
@@ -433,7 +433,7 @@ class TunnelUpstreamResponseState(ProxyState):
         LOG.debug(
             '[%s] Received from upstream and proxying downstream: "%s"',
             self.model.uuid,
-            upstream_data.decode("utf-8"),
+            decode_data_for_logging(upstream_data),
         )
 
         if upstream_data:
@@ -485,6 +485,17 @@ class ConnectionClosingState(ProxyState):
 
         # nothing more to do
         return None
+
+
+def decode_data_for_logging(data: bytes) -> str:
+    """Decode the data, if possible, and shorten it in order to make log readable."""
+    try:
+        decoded = data.decode("utf-8")
+    except UnicodeDecodeError:
+        decoded = "bytes that cannot be decoded to 'utf-8'"
+    if len(decoded) > 60:
+        decoded = decoded[:57] + "..."
+    return decoded
 
 
 if __name__ == "__main__":
