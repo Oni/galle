@@ -12,6 +12,8 @@ import socket
 from collections import deque
 import pathlib
 import configparser
+from enum import Enum
+from collections import defaultdict
 
 from proxyprotocol.server import Address
 
@@ -19,6 +21,13 @@ from proxyprotocol.server import Address
 LOG = logging.getLogger(__name__)
 BUFFER_LEN = 1024
 UPSTREAM_CONNECTION_TIMEOUT = 5  # seconds
+
+
+class Mode(Enum):
+    HTTP = 1
+    PP = 2
+    PP_V1 = 3
+    PP_V2 = 4
 
 
 async def main() -> int:
@@ -68,19 +77,27 @@ async def main() -> int:
 
     logging.basicConfig(level=log_level, format="%(asctime)-15s %(name)s %(message)s")
 
-    configs = {"http": []}
+    configs = defaultdict(list)
     for section in config.sections():
         if section != "logging":
+            available_modes = {
+                "http": Mode.HTTP,
+                "pp": Mode.PP,
+                "pp_v1": Mode.PP_V1,
+                "pp_v2": Mode.PP_V2,
+            }
             try:
-                mode = config.get(section, "mode")
+                mode_s = config.get(section, "mode")
             except configparser.NoOptionError:
                 print(
                     f"Invalid config file: missing 'mode' option in [{section}] section"
                 )
                 return 1
-            if mode not in ("http",):
+            try:
+                mode = available_modes[mode_s]
+            except KeyError:
                 print(
-                    f"Invalid config file: 'mode' option in [{section}] section must be 'http'"
+                    f"Invalid config file: 'mode' option in [{section}] section must be one of {[x for x in available_modes.keys()]}"
                 )
                 return 1
 
@@ -124,7 +141,7 @@ async def main() -> int:
 
     loop = asyncio.get_event_loop()
     forevers = []
-    for upstream, listening_port, allowed_hosts, allowed_ips in configs["http"]:
+    for upstream, listening_port, allowed_hosts, allowed_ips in configs[Mode.HTTP]:
         allowed_addresses = [Address(x) for x in allowed_hosts]
         allowed_ip_networks = []
         for allowed_ip in allowed_ips:
@@ -140,7 +157,7 @@ async def main() -> int:
             server = await make_server(
                 listening_port,
                 Address(upstream),
-                "http",
+                Mode.HTTP,
                 allowed_addresses,
                 allowed_ip_networks,
             )
@@ -172,14 +189,14 @@ async def main() -> int:
 def make_server(
     listening_port: int,
     upstream: Address,
-    mode: str,
+    mode: Mode,
     allowed_addresses: List[Address],
     allowed_ip_networks: List[ipaddress.IPv4Network],
 ) -> asyncio.coroutine:
     """Return a server that needs to be awaited."""
 
     address = Address(f"0.0.0.0:{listening_port}")
-    if mode == "http":
+    if mode == Mode.HTTP:
         proxy_partial = partial(
             proxy,
             upstream=upstream,
