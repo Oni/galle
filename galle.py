@@ -13,7 +13,6 @@ from collections import deque
 import pathlib
 import configparser
 from enum import Enum
-from collections import defaultdict
 
 from proxyprotocol.server import Address
 
@@ -77,7 +76,7 @@ async def main() -> int:
 
     logging.basicConfig(level=log_level, format="%(asctime)-15s %(name)s %(message)s")
 
-    configs = defaultdict(list)
+    configs = []
     for section in config.sections():
         if section != "logging":
             available_modes = {
@@ -137,11 +136,11 @@ async def main() -> int:
                 )
                 return 1
 
-            configs[mode].append((section, listening_port, allowed_hosts, allowed_ips))
+            configs.append((mode, section, listening_port, allowed_hosts, allowed_ips))
 
     loop = asyncio.get_event_loop()
     forevers = []
-    for upstream, listening_port, allowed_hosts, allowed_ips in configs[Mode.HTTP]:
+    for mode, upstream, listening_port, allowed_hosts, allowed_ips in configs:
         allowed_addresses = [Address(x) for x in allowed_hosts]
         allowed_ip_networks = []
         for allowed_ip in allowed_ips:
@@ -157,7 +156,7 @@ async def main() -> int:
             server = await make_server(
                 listening_port,
                 Address(upstream),
-                Mode.HTTP,
+                mode,
                 allowed_addresses,
                 allowed_ip_networks,
             )
