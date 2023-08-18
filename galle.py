@@ -612,14 +612,20 @@ def is_valid_ip_port(
 
 
 def decode_data_for_logging(data: bytes) -> str:
-    """Decode the data, if possible, and shorten it in order to make log readable."""
-    try:
-        decoded = data.decode("utf-8")
-    except UnicodeDecodeError:
-        decoded = "bytes that cannot be decoded to 'utf-8'"
-    if len(decoded) > 60:
-        decoded = decoded[:57] + "..."
-    return decoded
+    """If log level is DEBUG, decode the data (if possible) and shorten it in order to make log
+    readable. For performance, if the log level is lower, just provide a placeholder text.
+    """
+
+    if LOG.level == logging.DEBUG:
+        try:
+            decoded = data.decode("utf-8")
+        except UnicodeDecodeError:
+            decoded = "bytes that cannot be decoded to 'utf-8'"
+        if len(decoded) > 60:
+            decoded = decoded[:57] + "..."
+        return decoded
+    else:
+        return "<some data>"
 
 
 if __name__ == "__main__":
