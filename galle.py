@@ -6,7 +6,7 @@ import asyncio
 import logging
 import signal
 import ipaddress
-from typing import List, Deque
+from typing import List, Deque, Type, TypeGuard, Tuple, Coroutine
 from functools import partial
 import socket
 from collections import deque
@@ -15,6 +15,8 @@ import configparser
 from enum import Enum
 
 from proxyprotocol.server import Address
+from proxyprotocol.reader import ProxyProtocolReader
+from proxyprotocol.detect import ProxyProtocolDetect, ProxyProtocolV1, ProxyProtocolV2
 
 
 LOG = logging.getLogger(__name__)
@@ -27,6 +29,11 @@ class Mode(Enum):
     PP = 2
     PP_V1 = 3
     PP_V2 = 4
+
+
+class PPVersion(Enum):
+    V1 = 1
+    V2 = 2
 
 
 async def main() -> int:
@@ -190,24 +197,25 @@ def make_server(
     upstream: Address,
     mode: Mode,
     allowed_addresses: List[Address],
-    allowed_ip_networks: List[ipaddress.IPv4Network],
-) -> asyncio.coroutine:
+    allowed_ip_networks: List[ipaddress.IPv4Network | ipaddress.IPv6Network],
+) -> Coroutine:
     """Return a server that needs to be awaited."""
 
     address = Address(f"0.0.0.0:{listening_port}")
-    if mode == Mode.HTTP:
-        proxy_partial = partial(
-            proxy,
-            upstream=upstream,
-            allowed_addresses=allowed_addresses,
-            allowed_ip_networks=allowed_ip_networks,
-        )
+    proxy_partial = partial(
+        proxy,
+        mode=mode,
+        upstream=upstream,
+        allowed_addresses=allowed_addresses,
+        allowed_ip_networks=allowed_ip_networks,
+    )
     return asyncio.start_server(proxy_partial, address.host, address.port)
 
 
 async def proxy(
     downstream_reader: asyncio.StreamReader,
     downstream_writer: asyncio.StreamWriter,
+    mode: Mode,
     upstream: Address,
     allowed_addresses: List[Address],
     allowed_ip_networks: List[ipaddress.IPv4Network],
@@ -254,7 +262,18 @@ async def proxy(
             upstream_writer,
         )
 
-        state = UndecidedFilterState(model)
+        init_state: Type[ProxyState]
+        if mode == Mode.HTTP:
+            init_state = UndecidedHTTPFilterState
+        elif mode in (Mode.PP, Mode.PP_V1, Mode.PP_V2):
+            init_state = UndecidedPPFilterState
+
+        state: ProxyState | None = init_state(model)
+        if state is not None and is_pp_state(state):
+            if mode == Mode.PP_V1:
+                state.set_version(PPVersion.V1)
+            elif mode == Mode.PP_V2:
+                state.set_version(PPVersion.V2)
 
         try:
             while state is not None:
@@ -287,6 +306,34 @@ class ProxyModel:
         # buffer used before we know if a connection is accepted or not
         self.buffered_lines: Deque[bytes] = deque()
 
+    def is_source_ip_allowed(
+        self, source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address
+    ) -> bool:
+        # check by hostname
+        for allowed_address in self.allowed_addresses:
+            try:
+                allowed_hostname = allowed_address.host
+                allowed_ip = ipaddress.ip_address(
+                    socket.gethostbyname(allowed_hostname)
+                )
+            except socket.gaierror as err:
+                LOG.info(
+                    "[%s] Unable to resolve allowed host %s",
+                    self.uuid,
+                    allowed_hostname,
+                )
+                LOG.info(err.strerror)
+            else:
+                if source_ip == allowed_ip:
+                    return True
+
+        # check by ip
+        for allowed_ip_network in self.allowed_ip_networks:
+            if source_ip in allowed_ip_network:
+                return True
+
+        return False
+
 
 class ProxyState:
     """Generic ProxyState that needs to be sub-classed."""
@@ -301,14 +348,14 @@ class ProxyState:
         raise NotImplementedError
 
 
-class UndecidedFilterState(ProxyState):
-    """Initial state: read from downstream but don't pass data upstram because we still don't know
+class UndecidedHTTPFilterState(ProxyState):
+    """Initial state: read from downstream but don't pass data upstream because we still don't know
     if the connection must be dropped or proxied. We still didn't reach the relevant http header
     line."""
 
     async def next(
         self,
-    ) -> UndecidedFilterState | FilterPassState | FilterFailState | ConnectionClosingState:
+    ) -> UndecidedHTTPFilterState | FilterPassState | FilterFailState:
         """Buffer incoming downstream data waiting for the proper http header line.
 
         Nginx must append relevant ip to the X-Forwarded-For header line. The real source ip must be
@@ -344,41 +391,32 @@ class UndecidedFilterState(ProxyState):
         self.model.buffered_lines.append(downstream_line)
 
         if downstream_line.startswith(b"X-Forwarded-For:"):
-            real_ip = (
+            source_ip_s = (
                 downstream_line.split(b":")[1]
-                .split(b",")[-1]
+                .split(b",")[-1]  # right-most ip
                 .replace(b"\n", b"")
                 .replace(b"\r", b"")
                 .strip()
                 .decode("utf-8")
             )
 
-            # check by hostname
-            for allowed_address in self.model.allowed_addresses:
-                try:
-                    allowed_hostname = allowed_address.host
-                    allowed_ip = socket.gethostbyname(allowed_hostname)
-                except socket.gaierror as err:
-                    LOG.info(
-                        "[%s] Unable to resolve allowed host %s",
-                        self.model.uuid,
-                        allowed_hostname,
-                    )
-                    LOG.info(err.strerror)
-                else:
-                    if real_ip == allowed_ip:
-                        LOG.info("[%s] Real ip allowed: %s", self.model.uuid, real_ip)
-                        return FilterPassState(self.model)
+            try:
+                source_ip = ipaddress.ip_address(source_ip_s)
+            except ValueError:
+                LOG.info(
+                    "[%s] Invalid format for ip in 'X-Forwarded-For' %s",
+                    self.model.uuid,
+                    source_ip_s,
+                )
+                return FilterFailState(self.model)
 
-            # check by ip
-            ip = ipaddress.ip_address(real_ip)
-            for allowed_ip_network in self.model.allowed_ip_networks:
-                if ip in allowed_ip_network:
-                    LOG.info("[%s] Real ip allowed: %s", self.model.uuid, real_ip)
-                    return FilterPassState(self.model)
+            if self.model.is_source_ip_allowed(source_ip):
+                LOG.info("[%s] Real ip allowed: %s", self.model.uuid, source_ip)
+                return FilterPassState(self.model)
+            else:
+                LOG.info("[%s] Real ip forbidden: %s", self.model.uuid, source_ip)
+                return FilterFailState(self.model)
 
-            LOG.info("[%s] Real ip forbidden: %s", self.model.uuid, real_ip)
-            return FilterFailState(self.model)
         elif downstream_line == b"":
             LOG.info(
                 "[%s] Header not as expected: 'X-Forwarded-For' not found",
@@ -388,6 +426,62 @@ class UndecidedFilterState(ProxyState):
             return FilterFailState(self.model)
         else:
             return self
+
+
+class UndecidedPPFilterState(ProxyState):
+    """Apply the given filter based on the provided PROXY protocol.
+
+    For security reasons, downstream *must* provide a PROXY protocol, otherwise we refuse the
+    connection.
+
+    E.g. downstream Nginx must use:
+    proxy_pass galle:12345;
+    proxy_protocol on;
+    """
+
+    pp: ProxyProtocolDetect | ProxyProtocolV1 | ProxyProtocolV2
+
+    def __init__(self, model: ProxyModel):
+        super().__init__(model)
+
+        self.pp = ProxyProtocolDetect()
+
+    def set_version(self, version: PPVersion):
+        """The filter is smart enough to guess the correct version, but providing an explicit
+        version is more performant."""
+
+        if version == PPVersion.V1:
+            self.pp = ProxyProtocolV1()
+        if version == PPVersion.V2:
+            self.pp = ProxyProtocolV2()
+        else:
+            raise ValueError("Only version 1 or 2 are supported")
+
+    async def next(
+        self,
+    ) -> FilterPassState | FilterFailState:
+        """Read PROXY protocol header in order to apply the filter."""
+        header_reader = ProxyProtocolReader(self.pp)
+        try:
+            result = await header_reader.read(self.model.downstream_reader)
+        except Exception as err:
+            LOG.info(
+                "[%s] Invalid PROXY protocol v1 or v2 header",
+                self.model.uuid,
+            )
+            LOG.info(err)
+            return FilterFailState(self.model)
+
+        if is_valid_ip_port(result.source):
+            source_ip, _ = result.source
+            if self.model.is_source_ip_allowed(source_ip):
+                LOG.info("[%s] Real ip allowed: %s", self.model.uuid, source_ip)
+                return FilterPassState(self.model)
+            else:
+                LOG.info("[%s] Real ip forbidden: %s", self.model.uuid, source_ip)
+                return FilterFailState(self.model)
+        else:
+            return FilterFailState(self.model)
 
 
 class FilterPassState(ProxyState):
@@ -501,6 +595,20 @@ class ConnectionClosingState(ProxyState):
 
         # nothing more to do
         return None
+
+
+def is_pp_state(state: ProxyState) -> TypeGuard[UndecidedPPFilterState]:
+    return isinstance(state, UndecidedPPFilterState)
+
+
+def is_valid_ip_port(
+    source: str
+    | tuple[ipaddress.IPv4Address, int]
+    | tuple[ipaddress.IPv6Address, int]
+    | None
+) -> TypeGuard[Tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]]:
+    """Provide a TypeGuard for ProxyProtocolReader.read() result."""
+    return isinstance(source, tuple)
 
 
 def decode_data_for_logging(data: bytes) -> str:
