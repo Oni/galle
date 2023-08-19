@@ -84,64 +84,61 @@ async def main() -> int:
     logging.basicConfig(level=log_level, format="%(asctime)-15s %(name)s %(message)s")
 
     configs = []
-    for section in config.sections():
-        if section != "logging":
-            available_modes = {
-                "http": Mode.HTTP,
-                "pp": Mode.PP,
-                "pp_v1": Mode.PP_V1,
-                "pp_v2": Mode.PP_V2,
-            }
-            try:
-                mode_s = config.get(section, "mode")
-            except configparser.NoOptionError:
-                print(
-                    f"Invalid config file: missing 'mode' option in [{section}] section"
-                )
-                return 1
-            try:
-                mode = available_modes[mode_s]
-            except KeyError:
-                print(
-                    f"Invalid config file: 'mode' option in [{section}] section must be one of {[x for x in available_modes.keys()]}"
-                )
-                return 1
+    for section in [x for x in config.sections() if x != "logging"]:
+        available_modes = {
+            "http": Mode.HTTP,
+            "pp": Mode.PP,
+            "pp_v1": Mode.PP_V1,
+            "pp_v2": Mode.PP_V2,
+        }
+        try:
+            mode_s = config.get(section, "mode")
+        except configparser.NoOptionError:
+            print(f"Invalid config file: missing 'mode' option in [{section}] section")
+            return 1
+        try:
+            mode = available_modes[mode_s]
+        except KeyError:
+            print(
+                f"Invalid config file: 'mode' option in [{section}] section must be one of {[x for x in available_modes.keys()]}"
+            )
+            return 1
 
-            try:
-                listening_port_s = config.get(section, "listening_port")
-            except configparser.NoOptionError:
-                print(
-                    f"Invalid config file: missing 'listening_port' option in [{section}] section"
-                )
-                return 1
-            try:
-                listening_port = int(listening_port_s)
-            except ValueError:
-                print(
-                    f"Invalid config file: 'listening_port' option in [{section}] section must be "
-                    "an int"
-                )
-                return 1
+        try:
+            listening_port_s = config.get(section, "listening_port")
+        except configparser.NoOptionError:
+            print(
+                f"Invalid config file: missing 'listening_port' option in [{section}] section"
+            )
+            return 1
+        try:
+            listening_port = int(listening_port_s)
+        except ValueError:
+            print(
+                f"Invalid config file: 'listening_port' option in [{section}] section must be "
+                "an int"
+            )
+            return 1
 
-            try:
-                allowed_hosts = [
-                    x.strip() for x in config.get(section, "allowed_hosts").split(",")
-                ]
-            except configparser.NoOptionError:
-                print(
-                    f"Invalid config file: missing 'allowed_hosts' option in [{section}] section"
-                )
-                return 1
+        try:
+            allowed_hosts = [
+                x.strip() for x in config.get(section, "allowed_hosts").split(",")
+            ]
+        except configparser.NoOptionError:
+            print(
+                f"Invalid config file: missing 'allowed_hosts' option in [{section}] section"
+            )
+            return 1
 
-            try:
-                allowed_ips = [
-                    x.strip() for x in config.get(section, "allowed_ips").split(",")
-                ]
-            except configparser.NoOptionError:
-                print(
-                    f"Invalid config file: missing 'allowed_ips' option in [{section}] section"
-                )
-                return 1
+        try:
+            allowed_ips = [
+                x.strip() for x in config.get(section, "allowed_ips").split(",")
+            ]
+        except configparser.NoOptionError:
+            print(
+                f"Invalid config file: missing 'allowed_ips' option in [{section}] section"
+            )
+            return 1
 
             configs.append((mode, section, listening_port, allowed_hosts, allowed_ips))
 
