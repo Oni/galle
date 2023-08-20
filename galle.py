@@ -96,8 +96,8 @@ async def main() -> int:
             mode = available_modes[mode_s]
         except KeyError:
             print(
-                f"Invalid config file: 'mode' option in [{section}] section must be one of "
-                "{[x for x in available_modes.keys()]}"
+                f"Invalid config file: 'mode' option in [{section}] section must be one of 'http', "
+                "'pp' (PROXY protocol, autodetect version), 'pp_v1' or 'pp_v2'"
             )
             return 1
 
