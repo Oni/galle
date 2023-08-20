@@ -17,6 +17,7 @@ from enum import Enum
 from proxyprotocol.server import Address
 from proxyprotocol.reader import ProxyProtocolReader
 from proxyprotocol.detect import ProxyProtocolDetect, ProxyProtocolV1, ProxyProtocolV2
+from proxyprotocol.result import ProxyResult
 
 
 LOG = logging.getLogger(__name__)
@@ -29,11 +30,6 @@ class Mode(Enum):
     PP = 2
     PP_V1 = 3
     PP_V2 = 4
-
-
-class PPVersion(Enum):
-    V1 = 1
-    V2 = 2
 
 
 async def main() -> int:
@@ -100,9 +96,30 @@ async def main() -> int:
             mode = available_modes[mode_s]
         except KeyError:
             print(
-                f"Invalid config file: 'mode' option in [{section}] section must be one of {[x for x in available_modes.keys()]}"
+                f"Invalid config file: 'mode' option in [{section}] section must be one of "
+                "{[x for x in available_modes.keys()]}"
             )
             return 1
+
+        if mode in (Mode.PP, Mode.PP_V1, Mode.PP_V2):
+            try:
+                repeat_s = config.get(section, "repeat")
+            except configparser.NoOptionError:
+                print(
+                    f"Invalid config file: missing 'repeat' option in [{section}] section (needed "
+                    "for PROXY protocol sections)"
+                )
+                return 1
+            try:
+                repeat = {"true": True, "false": False}[repeat_s.lower()]
+            except KeyError:
+                print(
+                    f"Invalid config file: 'repeat' option in [{section}] section must be 'true' "
+                    "or 'false'"
+                )
+                return 1
+        else:
+            repeat = False
 
         try:
             listening_port_s = config.get(section, "listening_port")
@@ -140,11 +157,13 @@ async def main() -> int:
             )
             return 1
 
-            configs.append((mode, section, listening_port, allowed_hosts, allowed_ips))
+        configs.append(
+            (mode, repeat, section, listening_port, allowed_hosts, allowed_ips)
+        )
 
     loop = asyncio.get_event_loop()
     forevers = []
-    for mode, upstream, listening_port, allowed_hosts, allowed_ips in configs:
+    for mode, repeat, upstream, listening_port, allowed_hosts, allowed_ips in configs:
         allowed_addresses = [Address(x) for x in allowed_hosts]
         allowed_ip_networks = []
         for allowed_ip in allowed_ips:
@@ -161,6 +180,7 @@ async def main() -> int:
                 listening_port,
                 Address(upstream),
                 mode,
+                repeat,
                 allowed_addresses,
                 allowed_ip_networks,
             )
@@ -193,6 +213,7 @@ def make_server(
     listening_port: int,
     upstream: Address,
     mode: Mode,
+    repeat: bool,
     allowed_addresses: List[Address],
     allowed_ip_networks: List[ipaddress.IPv4Network | ipaddress.IPv6Network],
 ) -> Coroutine:
@@ -202,6 +223,7 @@ def make_server(
     proxy_partial = partial(
         proxy,
         mode=mode,
+        repeat=repeat,
         upstream=upstream,
         allowed_addresses=allowed_addresses,
         allowed_ip_networks=allowed_ip_networks,
@@ -213,6 +235,7 @@ async def proxy(
     downstream_reader: asyncio.StreamReader,
     downstream_writer: asyncio.StreamWriter,
     mode: Mode,
+    repeat: bool,
     upstream: Address,
     allowed_addresses: List[Address],
     allowed_ip_networks: List[ipaddress.IPv4Network],
@@ -251,6 +274,7 @@ async def proxy(
         # upstream connection established
         model = ProxyModel(
             uuid,
+            repeat,
             allowed_addresses,
             allowed_ip_networks,
             downstream_reader,
@@ -263,15 +287,14 @@ async def proxy(
         if mode == Mode.HTTP:
             init_state = UndecidedHTTPFilterState
         elif mode in (Mode.PP, Mode.PP_V1, Mode.PP_V2):
+            model.pp = {
+                Mode.PP: ProxyProtocolDetect,
+                Mode.PP_V1: ProxyProtocolV1,
+                Mode.PP_V2: ProxyProtocolV2,
+            }[mode]()
             init_state = UndecidedPPFilterState
 
         state: ProxyState | None = init_state(model)
-        if state is not None and is_pp_state(state):
-            if mode == Mode.PP_V1:
-                state.set_version(PPVersion.V1)
-            elif mode == Mode.PP_V2:
-                state.set_version(PPVersion.V2)
-
         try:
             while state is not None:
                 state = await state.next()
@@ -285,6 +308,7 @@ class ProxyModel:
     def __init__(
         self,
         uuid: int,
+        repeat: bool,
         allowed_addresses: List[Address],
         allowed_ip_networks: List[ipaddress.IPv4Network],
         downstream_reader: asyncio.StreamReader,
@@ -293,12 +317,16 @@ class ProxyModel:
         upstream_writer: asyncio.StreamWriter,
     ):
         self.uuid = uuid
+        self.repeat = repeat
         self.allowed_addresses = allowed_addresses
         self.allowed_ip_networks = allowed_ip_networks
         self.downstream_reader = downstream_reader
         self.downstream_writer = downstream_writer
         self.upstream_reader = upstream_reader
         self.upstream_writer = upstream_writer
+
+        self.pp: None | ProxyProtocolDetect | ProxyProtocolV1 | ProxyProtocolV2 = None
+        self.pp_result: None | ProxyResult = None
 
         # buffer used before we know if a connection is accepted or not
         self.buffered_lines: Deque[bytes] = deque()
@@ -436,31 +464,18 @@ class UndecidedPPFilterState(ProxyState):
     proxy_protocol on;
     """
 
-    pp: ProxyProtocolDetect | ProxyProtocolV1 | ProxyProtocolV2
-
-    def __init__(self, model: ProxyModel):
-        super().__init__(model)
-
-        self.pp = ProxyProtocolDetect()
-
-    def set_version(self, version: PPVersion):
-        """The filter is smart enough to guess the correct version, but providing an explicit
-        version is more performant."""
-
-        if version == PPVersion.V1:
-            self.pp = ProxyProtocolV1()
-        if version == PPVersion.V2:
-            self.pp = ProxyProtocolV2()
-        else:
-            raise ValueError("Only version 1 or 2 are supported")
-
     async def next(
         self,
     ) -> FilterPassState | FilterFailState:
         """Read PROXY protocol header in order to apply the filter."""
-        header_reader = ProxyProtocolReader(self.pp)
+
+        assert self.model.pp is not None
+
+        header_reader = ProxyProtocolReader(self.model.pp)
         try:
-            result = await header_reader.read(self.model.downstream_reader)
+            self.model.pp_result = await header_reader.read(
+                self.model.downstream_reader
+            )
         except Exception as err:
             LOG.info(
                 "[%s] Invalid PROXY protocol v1 or v2 header",
@@ -469,8 +484,8 @@ class UndecidedPPFilterState(ProxyState):
             LOG.info(err)
             return FilterFailState(self.model)
 
-        if is_valid_ip_port(result.source):
-            source_ip, _ = result.source
+        if is_valid_ip_port(self.model.pp_result.source):
+            source_ip, _ = self.model.pp_result.source
             if self.model.is_source_ip_allowed(source_ip):
                 LOG.info("[%s] Real ip allowed: %s", self.model.uuid, source_ip)
                 return FilterPassState(self.model)
@@ -487,6 +502,12 @@ class FilterPassState(ProxyState):
     async def next(self) -> FilterPassState | TunnelUpstreamResponseState:
         """Flush upstream the buffer accumulated by UndecidedFilterState and keep proxying data from
         downstream to upstream."""
+
+        if self.model.repeat:
+            assert self.model.pp is not None and self.model.pp_result is not None
+            self.model.upstream_writer.write(self.model.pp.pack(self.model.pp_result))
+            await self.model.upstream_writer.drain()
+            self.model.repeat = False  # pp header sent, no need to repeat it anymore
 
         while self.model.buffered_lines:
             LOG.debug(
@@ -592,10 +613,6 @@ class ConnectionClosingState(ProxyState):
 
         # nothing more to do
         return None
-
-
-def is_pp_state(state: ProxyState) -> TypeGuard[UndecidedPPFilterState]:
-    return isinstance(state, UndecidedPPFilterState)
 
 
 def is_valid_ip_port(
