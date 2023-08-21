@@ -62,6 +62,20 @@ async def main() -> int:
         return 1
 
     try:
+        inactivity_timeout_s = config.get("general", "inactivity_timeout")
+        # configparser.NoSectionError eventually raised by previous option query
+    except configparser.NoOptionError:
+        print(
+            "Invalid config file: no 'inactivity_timeout' option in [general] section"
+        )
+        return 1
+    try:
+        inactivity_timeout = float(inactivity_timeout_s)
+    except ValueError:
+        print("Invalid config file: the 'inactivity_timeout' must be an int or a float")
+        return 1
+
+    try:
         log_level = {
             "error": logging.ERROR,
             "warn": logging.WARN,
@@ -176,6 +190,7 @@ async def main() -> int:
                 repeat,
                 allowed_addresses,
                 allowed_ip_networks,
+                inactivity_timeout,
             )
         except OSError as err:
             LOG.error("Unable to run http proxy at local port %s", listening_port)
@@ -209,6 +224,7 @@ def make_server(
     repeat: bool,
     allowed_addresses: List[Address],
     allowed_ip_networks: List[ipaddress.IPv4Network | ipaddress.IPv6Network],
+    inactivity_timeout: float,
 ) -> Coroutine:
     """Return a server that needs to be awaited."""
 
@@ -220,6 +236,7 @@ def make_server(
         upstream=upstream,
         allowed_addresses=allowed_addresses,
         allowed_ip_networks=allowed_ip_networks,
+        inactivity_timeout=inactivity_timeout,
     )
     return asyncio.start_server(proxy_partial, address.host, address.port)
 
@@ -232,6 +249,7 @@ async def proxy(
     upstream: Address,
     allowed_addresses: List[Address],
     allowed_ip_networks: List[ipaddress.IPv4Network],
+    inactivity_timeout: float,
 ) -> None:
     """Handle the incoming connection."""
 
@@ -292,7 +310,7 @@ async def proxy(
                 """The idea here is to have a shared timeout among the pipes. Every time any pipe
                 receives some data, the timeout is 'reset' and waits more time on both pipes.
                 """
-                timeout = InactivityTimeout(5.0)
+                timeout = InactivityTimeout(inactivity_timeout)
 
                 forward_pipe = pipe(downstream_reader, upstream_writer, timeout)
                 backward_pipe = pipe(upstream_reader, downstream_writer, timeout)
