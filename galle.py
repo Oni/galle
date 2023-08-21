@@ -79,6 +79,15 @@ async def main() -> int:
 
     configs = []
     for section in [x for x in config.sections() if x != "logging"]:
+        try:
+            listening_port = int(section)
+        except ValueError:
+            print(
+                "Invalid config file: the section name (the port we want to listen to) must be an "
+                "int"
+            )
+            return 1
+
         available_modes = {
             "pp_v1": Mode.PP_V1,
             "pp_v2": Mode.PP_V2,
@@ -114,18 +123,10 @@ async def main() -> int:
             return 1
 
         try:
-            listening_port_s = config.get(section, "listening_port")
+            upstream = config.get(section, "upstream")
         except configparser.NoOptionError:
             print(
-                f"Invalid config file: missing 'listening_port' option in [{section}] section"
-            )
-            return 1
-        try:
-            listening_port = int(listening_port_s)
-        except ValueError:
-            print(
-                f"Invalid config file: 'listening_port' option in [{section}] section must be "
-                "an int"
+                f"Invalid config file: missing 'upstream' option in [{section}] section"
             )
             return 1
 
@@ -150,7 +151,7 @@ async def main() -> int:
             return 1
 
         configs.append(
-            (mode, repeat, section, listening_port, allowed_hosts, allowed_ips)
+            (mode, repeat, upstream, listening_port, allowed_hosts, allowed_ips)
         )
 
     loop = asyncio.get_event_loop()
