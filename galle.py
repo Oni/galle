@@ -290,12 +290,9 @@ async def proxy(
                     await upstream_writer.drain()
 
                 """The idea here is to have a shared timeout among the pipes. Every time any pipe
-                receives some data, the timeout is 'reset' and waits more time (soft timeout) on
-                both pipes.
-
-                At some point the timeout will run out of time (hard timeout) independently of how
-                many times the timeout is reset by the forward or backward pipe."""
-                timeout = Timeout(0.1, 5.0)
+                receives some data, the timeout is 'reset' and waits more time on both pipes.
+                """
+                timeout = InactivityTimeout(5.0)
 
                 forward_pipe = pipe(downstream_reader, upstream_writer, timeout)
                 backward_pipe = pipe(upstream_reader, downstream_writer, timeout)
@@ -354,7 +351,9 @@ def is_source_ip_allowed(
 
 
 async def pipe(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, timeout: Timeout
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    timeout: InactivityTimeout,
 ) -> None:
     remaining_seconds = timeout.remaining
     while remaining_seconds and not reader.at_eof():
@@ -369,31 +368,22 @@ async def pipe(
         remaining_seconds = timeout.remaining
 
 
-class Timeout:
+class InactivityTimeout:
     """
     This Object handles shared pipe timeout.
     """
 
-    def __init__(self, soft: float, strong: float):
+    def __init__(self, timeout):
         """
-        The strong timeout is the maximum allowed timeout to ever be allowed, in seconds. The soft
-        one instead is prolonged every time we 'awake()' this Timeout.
+        The remaining time until timeout is prolonged every time we 'awake()' this
+        InactivityTimeout.
 
-        E.g. if we have t = Timeout(5, 20), t.remaining should be around 5 seconds.
+        E.g. if we have t = InactivityTimeout(5), t.remaining should be around 5 seconds.
         If, after 3 seconds we query t.remaining again, we should get around 2 seconds.
         If we call t.awake() and we query t.remaining, it should be back again at around 5 seconds.
-
-        We can 't.awake()' as many times as we want, but after 20 seconds t.remaining will be 0.
         """
-        now = time.time()
-
         self.last_awake = time.time()
-        self.soft = soft
-        self.strong_limit = now + strong
-
-    @property
-    def soft_limit(self) -> float:
-        return self.last_awake + self.soft
+        self.timeout = timeout
 
     def awake(self) -> None:
         self.last_awake = time.time()
@@ -401,7 +391,7 @@ class Timeout:
     @property
     def remaining(self) -> float:  # >= 0
         now = time.time()
-        remaining = min(self.strong_limit - now, self.soft_limit - now)
+        remaining = self.last_awake + self.timeout - now
         return max(remaining, 0)
 
 
