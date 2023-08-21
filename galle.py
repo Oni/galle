@@ -6,18 +6,18 @@ import asyncio
 import logging
 import signal
 import ipaddress
-from typing import List, Deque, Type, TypeGuard, Tuple, Coroutine
+from typing import List, TypeGuard, Tuple, Coroutine
 from functools import partial
 import socket
-from collections import deque
 import pathlib
 import configparser
 from enum import Enum
+import time
 
 from proxyprotocol.server import Address
 from proxyprotocol.reader import ProxyProtocolReader
-from proxyprotocol.detect import ProxyProtocolDetect, ProxyProtocolV1, ProxyProtocolV2
-from proxyprotocol.result import ProxyResult
+from proxyprotocol.v1 import ProxyProtocolV1
+from proxyprotocol.v2 import ProxyProtocolV2
 
 
 LOG = logging.getLogger(__name__)
@@ -26,10 +26,8 @@ UPSTREAM_CONNECTION_TIMEOUT = 5  # seconds
 
 
 class Mode(Enum):
-    HTTP = 1
-    PP = 2
-    PP_V1 = 3
-    PP_V2 = 4
+    PP_V1 = 1
+    PP_V2 = 2
 
 
 async def main() -> int:
@@ -82,8 +80,6 @@ async def main() -> int:
     configs = []
     for section in [x for x in config.sections() if x != "logging"]:
         available_modes = {
-            "http": Mode.HTTP,
-            "pp": Mode.PP,
             "pp_v1": Mode.PP_V1,
             "pp_v2": Mode.PP_V2,
         }
@@ -96,30 +92,26 @@ async def main() -> int:
             mode = available_modes[mode_s]
         except KeyError:
             print(
-                f"Invalid config file: 'mode' option in [{section}] section must be one of 'http', "
-                "'pp' (PROXY protocol, autodetect version), 'pp_v1' or 'pp_v2'"
+                f"Invalid config file: 'mode' option in [{section}] section must be one of 'pp_v1' "
+                "or 'pp_v2'"
             )
             return 1
 
-        if mode in (Mode.PP, Mode.PP_V1, Mode.PP_V2):
-            try:
-                repeat_s = config.get(section, "repeat")
-            except configparser.NoOptionError:
-                print(
-                    f"Invalid config file: missing 'repeat' option in [{section}] section (needed "
-                    "for PROXY protocol sections)"
-                )
-                return 1
-            try:
-                repeat = {"true": True, "false": False}[repeat_s.lower()]
-            except KeyError:
-                print(
-                    f"Invalid config file: 'repeat' option in [{section}] section must be 'true' "
-                    "or 'false'"
-                )
-                return 1
-        else:
-            repeat = False
+        try:
+            repeat_s = config.get(section, "repeat")
+        except configparser.NoOptionError:
+            print(
+                f"Invalid config file: missing 'repeat' option in [{section}] section"
+            )
+            return 1
+        try:
+            repeat = {"true": True, "false": False}[repeat_s.lower()]
+        except KeyError:
+            print(
+                f"Invalid config file: 'repeat' option in [{section}] section must be 'true' or "
+                "'false'"
+            )
+            return 1
 
         try:
             listening_port_s = config.get(section, "listening_port")
@@ -271,348 +263,55 @@ async def proxy(
         LOG.error(err.strerror)
         downstream_writer.close()
     else:
-        # upstream connection established
-        model = ProxyModel(
-            uuid,
-            repeat,
-            allowed_addresses,
-            allowed_ip_networks,
-            downstream_reader,
-            downstream_writer,
-            upstream_reader,
-            upstream_writer,
-        )
+        pp: ProxyProtocolV1 | ProxyProtocolV2 = {
+            Mode.PP_V1: ProxyProtocolV1,
+            Mode.PP_V2: ProxyProtocolV2,
+        }[mode]()
 
-        init_state: Type[ProxyState]
-        if mode == Mode.HTTP:
-            init_state = UndecidedHTTPFilterState
-        elif mode in (Mode.PP, Mode.PP_V1, Mode.PP_V2):
-            model.pp = {
-                Mode.PP: ProxyProtocolDetect,
-                Mode.PP_V1: ProxyProtocolV1,
-                Mode.PP_V2: ProxyProtocolV2,
-            }[mode]()
-            init_state = UndecidedPPFilterState
-
-        state: ProxyState | None = init_state(model)
+        header_reader = ProxyProtocolReader(pp)
         try:
-            while state is not None:
-                state = await state.next()
-        except IOError:
-            pass
-
-    LOG.debug("[%s] Closed connection from %s:%s", uuid, *downstream_ip)
-
-
-class ProxyModel:
-    def __init__(
-        self,
-        uuid: int,
-        repeat: bool,
-        allowed_addresses: List[Address],
-        allowed_ip_networks: List[ipaddress.IPv4Network],
-        downstream_reader: asyncio.StreamReader,
-        downstream_writer: asyncio.StreamWriter,
-        upstream_reader: asyncio.StreamReader,
-        upstream_writer: asyncio.StreamWriter,
-    ):
-        self.uuid = uuid
-        self.repeat = repeat
-        self.allowed_addresses = allowed_addresses
-        self.allowed_ip_networks = allowed_ip_networks
-        self.downstream_reader = downstream_reader
-        self.downstream_writer = downstream_writer
-        self.upstream_reader = upstream_reader
-        self.upstream_writer = upstream_writer
-
-        self.pp: None | ProxyProtocolDetect | ProxyProtocolV1 | ProxyProtocolV2 = None
-        self.pp_result: None | ProxyResult = None
-
-        # buffer used before we know if a connection is accepted or not
-        self.buffered_lines: Deque[bytes] = deque()
-
-    def is_source_ip_allowed(
-        self, source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address
-    ) -> bool:
-        # check by hostname
-        for allowed_address in self.allowed_addresses:
-            try:
-                allowed_hostname = allowed_address.host
-                allowed_ip = ipaddress.ip_address(
-                    socket.gethostbyname(allowed_hostname)
-                )
-            except socket.gaierror as err:
-                LOG.info(
-                    "[%s] Unable to resolve allowed host %s",
-                    self.uuid,
-                    allowed_hostname,
-                )
-                LOG.info(err.strerror)
-            else:
-                if source_ip == allowed_ip:
-                    return True
-
-        # check by ip
-        for allowed_ip_network in self.allowed_ip_networks:
-            if source_ip in allowed_ip_network:
-                return True
-
-        return False
-
-
-class ProxyState:
-    """Generic ProxyState that needs to be sub-classed."""
-
-    def __init__(self, model: ProxyModel):
-        self.model = model
-
-    async def next(self) -> ProxyState | None:
-        """Return the next State instance. Can be 'self'. Can also be None if there is nothing more
-        to do."""
-
-        raise NotImplementedError
-
-
-class UndecidedHTTPFilterState(ProxyState):
-    """Initial state: read from downstream but don't pass data upstream because we still don't know
-    if the connection must be dropped or proxied. We still didn't reach the relevant http header
-    line."""
-
-    async def next(
-        self,
-    ) -> UndecidedHTTPFilterState | FilterPassState | FilterFailState:
-        """Buffer incoming downstream data waiting for the proper http header line.
-
-        Nginx must append relevant ip to the X-Forwarded-For header line. The real source ip must be
-        the one directly connecting to nginx or the one coming from the proxy-protocol.
-
-        E.g.:
-        proxy_set_header   X-Forwarded-For  $proxy_add_x_forwarded_for;
-
-        Or with proxy-protocol:
-        listen <port> proxy_protocol;
-        set_real_ip_from <trusted ip CIDR>;
-        real_ip_header proxy_protocol;
-        real_ip_recursive on;
-        ...
-        proxy_set_header   X-Forwarded-For  $proxy_add_x_forwarded_for;
-        """
-
-        downstream_line = b""
-        if not self.model.downstream_reader.at_eof():
-            try:
-                downstream_line = await asyncio.wait_for(
-                    self.model.downstream_reader.readline(), 1
-                )
-            except asyncio.TimeoutError:
-                pass
-
-        LOG.debug(
-            '[%s] Received from downstream (buffering): "%s"',
-            self.model.uuid,
-            decode_data_for_logging(downstream_line),
-        )
-
-        self.model.buffered_lines.append(downstream_line)
-
-        if downstream_line.startswith(b"X-Forwarded-For:"):
-            source_ip_s = (
-                downstream_line.split(b":")[1]
-                .split(b",")[-1]  # right-most ip
-                .replace(b"\n", b"")
-                .replace(b"\r", b"")
-                .strip()
-                .decode("utf-8")
-            )
-
-            try:
-                source_ip = ipaddress.ip_address(source_ip_s)
-            except ValueError:
-                LOG.info(
-                    "[%s] Invalid format for ip in 'X-Forwarded-For' %s",
-                    self.model.uuid,
-                    source_ip_s,
-                )
-                return FilterFailState(self.model)
-
-            if self.model.is_source_ip_allowed(source_ip):
-                LOG.info("[%s] Real ip allowed: %s", self.model.uuid, source_ip)
-                return FilterPassState(self.model)
-            else:
-                LOG.info("[%s] Real ip forbidden: %s", self.model.uuid, source_ip)
-                return FilterFailState(self.model)
-
-        elif downstream_line == b"":
-            LOG.info(
-                "[%s] Header not as expected: 'X-Forwarded-For' not found",
-                self.model.uuid,
-            )
-            # read all data, but filter is still uncertain: fail by default
-            return FilterFailState(self.model)
-        else:
-            return self
-
-
-class UndecidedPPFilterState(ProxyState):
-    """Apply the given filter based on the provided PROXY protocol.
-
-    For security reasons, downstream *must* provide a PROXY protocol, otherwise we refuse the
-    connection.
-
-    E.g. downstream Nginx must use:
-    proxy_pass galle:12345;
-    proxy_protocol on;
-    """
-
-    async def next(
-        self,
-    ) -> FilterPassState | FilterFailState:
-        """Read PROXY protocol header in order to apply the filter."""
-
-        assert self.model.pp is not None
-
-        header_reader = ProxyProtocolReader(self.model.pp)
-        try:
-            self.model.pp_result = await header_reader.read(
-                self.model.downstream_reader
-            )
+            pp_result = await header_reader.read(downstream_reader)
         except Exception as err:
+            pp_result = None
             LOG.info(
-                "[%s] Invalid PROXY protocol v1 or v2 header",
-                self.model.uuid,
+                "[%s] Invalid PROXY protocol header",
+                uuid,
             )
             LOG.info(err)
-            return FilterFailState(self.model)
 
-        if is_valid_ip_port(self.model.pp_result.source):
-            source_ip, _ = self.model.pp_result.source
-            if self.model.is_source_ip_allowed(source_ip):
-                LOG.info("[%s] Real ip allowed: %s", self.model.uuid, source_ip)
-                return FilterPassState(self.model)
+        if pp_result is not None and is_valid_ip_port(pp_result.source):
+            source_ip, _ = pp_result.source
+            if is_source_ip_allowed(source_ip, allowed_addresses, allowed_ip_networks):
+                LOG.info("[%s] Real ip allowed: %s", uuid, source_ip)
+
+                if repeat:
+                    upstream_writer.write(pp.pack(pp_result))
+                    await upstream_writer.drain()
+
+                """The idea here is to have a shared timeout among the pipes. Every time any pipe
+                receives some data, the timeout is 'reset' and waits more time (soft timeout) on
+                both pipes.
+
+                At some point the timeout will run out of time (hard timeout) independently of how
+                many times the timeout is reset by the forward or backward pipe."""
+                timeout = Timeout(0.1, 5.0)
+
+                forward_pipe = pipe(downstream_reader, upstream_writer, timeout)
+                backward_pipe = pipe(upstream_reader, downstream_writer, timeout)
+                await asyncio.gather(backward_pipe, forward_pipe)
             else:
-                LOG.info("[%s] Real ip forbidden: %s", self.model.uuid, source_ip)
-                return FilterFailState(self.model)
-        else:
-            return FilterFailState(self.model)
+                LOG.info("[%s] Real ip forbidden: %s", uuid, source_ip)
 
+        await asyncio.sleep(0.1)  # wait for writes to actually drain
 
-class FilterPassState(ProxyState):
-    """Filter has decided: data can be passed upstream."""
-
-    async def next(self) -> FilterPassState | TunnelUpstreamResponseState:
-        """Flush upstream the buffer accumulated by UndecidedFilterState and keep proxying data from
-        downstream to upstream."""
-
-        if self.model.repeat:
-            assert self.model.pp is not None and self.model.pp_result is not None
-            self.model.upstream_writer.write(self.model.pp.pack(self.model.pp_result))
-            await self.model.upstream_writer.drain()
-            self.model.repeat = False  # pp header sent, no need to repeat it anymore
-
-        while self.model.buffered_lines:
-            LOG.debug(
-                "[%s] Flushing buffer from downstream to upstream", self.model.uuid
-            )
-            self.model.upstream_writer.write(self.model.buffered_lines.popleft())
-
-        await self.model.upstream_writer.drain()
-
-        downstream_data = b""
-        if not self.model.downstream_reader.at_eof():
+        for writer in (downstream_writer, upstream_writer):
+            writer.close()
             try:
-                downstream_data = await asyncio.wait_for(
-                    self.model.downstream_reader.read(BUFFER_LEN), 1
-                )
-            except asyncio.TimeoutError:
+                await writer.wait_closed()
+            except ConnectionAbortedError:
                 pass
-        LOG.debug(
-            '[%s] Received from downstream and proxying upstream: "%s"',
-            self.model.uuid,
-            decode_data_for_logging(downstream_data),
-        )
 
-        if downstream_data != b"":
-            self.model.upstream_writer.write(downstream_data)
-            await self.model.upstream_writer.drain()
-
-            # perhaps there is more to read and proxy upstream
-            return self
-
-        else:
-            # EOF (or equivalent) reached
-            self.model.upstream_writer.write_eof()
-            return TunnelUpstreamResponseState(self.model)
-
-
-class TunnelUpstreamResponseState(ProxyState):
-    """Proxy upstream response."""
-
-    async def next(self) -> TunnelUpstreamResponseState | ConnectionClosingState:
-        """Read response from upstream and proxy it downstream."""
-
-        upstream_data = b""
-        if not self.model.upstream_reader.at_eof():
-            try:
-                upstream_data = await asyncio.wait_for(
-                    self.model.upstream_reader.read(BUFFER_LEN), 1
-                )
-            except asyncio.TimeoutError:
-                pass
-        LOG.debug(
-            '[%s] Received from upstream and proxying downstream: "%s"',
-            self.model.uuid,
-            decode_data_for_logging(upstream_data),
-        )
-
-        if upstream_data:
-            self.model.downstream_writer.write(upstream_data)
-            await self.model.downstream_writer.drain()
-
-            # perhaps there is more to read and proxy downstream
-            return self
-        else:
-            # EOF (or equivalent) reached
-            self.model.downstream_writer.write_eof()
-            await self.model.downstream_writer.drain()
-            return ConnectionClosingState(self.model)
-
-
-class FilterFailState(ProxyState):
-    """Filter has decided: data can't be passed upstream."""
-
-    async def next(self) -> ConnectionClosingState:
-        """Drop downstream connection."""
-
-        LOG.debug("[%s] Dropping downstream connection", self.model.uuid)
-
-        self.model.downstream_writer.write(b"HTTP/1.1 444 NO RESPONSE\r\n\r\n")
-        self.model.downstream_writer.write_eof()
-        await self.model.downstream_writer.drain()
-
-        return ConnectionClosingState(self.model)
-
-
-class ConnectionClosingState(ProxyState):
-    """Cleanup connections."""
-
-    async def next(self) -> None:
-        """Close upstream and downstream connections."""
-
-        await asyncio.sleep(2)  # wait for writes to actually drain
-        self.model.downstream_writer.close()
-        self.model.upstream_writer.close()
-
-        try:
-            await self.model.downstream_writer.wait_closed()
-        except ConnectionAbortedError:
-            pass
-        try:
-            await self.model.upstream_writer.wait_closed()
-        except ConnectionAbortedError:
-            pass
-
-        # nothing more to do
-        return None
+    LOG.debug("[%s] Closed connection from %s:%s", uuid, *downstream_ip)
 
 
 def is_valid_ip_port(
@@ -623,6 +322,86 @@ def is_valid_ip_port(
 ) -> TypeGuard[Tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]]:
     """Provide a TypeGuard for ProxyProtocolReader.read() result."""
     return isinstance(source, tuple)
+
+
+def is_source_ip_allowed(
+    source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    allowed_addresses: List[Address],
+    allowed_ip_networks: List[ipaddress.IPv4Network],
+) -> bool:
+    # check by hostname
+    for allowed_address in allowed_addresses:
+        try:
+            allowed_hostname = allowed_address.host
+            allowed_ip = ipaddress.ip_address(socket.gethostbyname(allowed_hostname))
+        except socket.gaierror as err:
+            LOG.info(
+                "Unable to resolve allowed host %s",
+                allowed_hostname,
+            )
+            LOG.info(err.strerror)
+        else:
+            if source_ip == allowed_ip:
+                return True
+
+    # check by ip
+    for allowed_ip_network in allowed_ip_networks:
+        if source_ip in allowed_ip_network:
+            return True
+
+    return False
+
+
+async def pipe(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, timeout: Timeout
+) -> None:
+    remaining_seconds = timeout.remaining
+    while remaining_seconds and not reader.at_eof():
+        try:
+            writer.write(
+                await asyncio.wait_for(reader.read(BUFFER_LEN), remaining_seconds)
+            )
+            timeout.awake()
+        except asyncio.TimeoutError:
+            pass
+
+        remaining_seconds = timeout.remaining
+
+
+class Timeout:
+    """
+    This Object handles shared pipe timeout.
+    """
+
+    def __init__(self, soft: float, strong: float):
+        """
+        The strong timeout is the maximum allowed timeout to ever be allowed, in seconds. The soft
+        one instead is prolonged every time we 'awake()' this Timeout.
+
+        E.g. if we have t = Timeout(5, 20), t.remaining should be around 5 seconds.
+        If, after 3 seconds we query t.remaining again, we should get around 2 seconds.
+        If we call t.awake() and we query t.remaining, it should be back again at around 5 seconds.
+
+        We can 't.awake()' as many times as we want, but after 20 seconds t.remaining will be 0.
+        """
+        now = time.time()
+
+        self.last_awake = time.time()
+        self.soft = soft
+        self.strong_limit = now + strong
+
+    @property
+    def soft_limit(self) -> float:
+        return self.last_awake + self.soft
+
+    def awake(self) -> None:
+        self.last_awake = time.time()
+
+    @property
+    def remaining(self) -> float:  # >= 0
+        now = time.time()
+        remaining = min(self.strong_limit - now, self.soft_limit - now)
+        return max(remaining, 0)
 
 
 def decode_data_for_logging(data: bytes) -> str:
