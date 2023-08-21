@@ -53,12 +53,12 @@ async def main() -> int:
     config.read(config_path)
 
     try:
-        config_log_level = config.get("logging", "level")
+        config_log_level = config.get("general", "log_level")
     except configparser.NoSectionError:
-        print("Invalid config file: no [logging] section")
+        print("Invalid config file: no [general] section")
         return 1
     except configparser.NoOptionError:
-        print("Invalid config file: no 'level' option in [logging] section")
+        print("Invalid config file: no 'level' option in [general] section")
         return 1
 
     try:
@@ -70,7 +70,7 @@ async def main() -> int:
         }[config_log_level]
     except KeyError:
         print(
-            "Invalid config file: 'level' option in [logging] section must be 'error', 'warn', "
+            "Invalid config file: 'log_level' option in [general] section must be 'error', 'warn', "
             "'info' or 'debug'"
         )
         return 1
@@ -78,7 +78,7 @@ async def main() -> int:
     logging.basicConfig(level=log_level, format="%(asctime)-15s %(name)s %(message)s")
 
     configs = []
-    for section in [x for x in config.sections() if x != "logging"]:
+    for section in [x for x in config.sections() if x != "general"]:
         try:
             listening_port = int(section)
         except ValueError:
