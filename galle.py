@@ -324,7 +324,7 @@ async def proxy(
             writer.close()
             try:
                 await writer.wait_closed()
-            except ConnectionAbortedError:
+            except (ConnectionAbortedError, BrokenPipeError):
                 pass
 
     LOG.debug("[%s] Closed connection from %s:%s", uuid, *downstream_ip)
