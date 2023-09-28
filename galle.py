@@ -231,9 +231,9 @@ def make_server(
     address = Address(f"0.0.0.0:{listening_port}")
     proxy_partial = partial(
         proxy,
+        upstream=upstream,
         mode=mode,
         repeat=repeat,
-        upstream=upstream,
         allowed_addresses=allowed_addresses,
         allowed_ip_networks=allowed_ip_networks,
         inactivity_timeout=inactivity_timeout,
@@ -244,9 +244,9 @@ def make_server(
 async def proxy(
     downstream_reader: asyncio.StreamReader,
     downstream_writer: asyncio.StreamWriter,
+    upstream: Address,
     mode: Mode,
     repeat: bool,
-    upstream: Address,
     allowed_addresses: List[Address],
     allowed_ip_networks: List[ipaddress.IPv4Network],
     inactivity_timeout: float,
