@@ -231,6 +231,7 @@ def make_server(
     address = Address(f"0.0.0.0:{listening_port}")
     proxy_partial = partial(
         proxy,
+        listening_port=listening_port,
         upstream=upstream,
         mode=mode,
         repeat=repeat,
@@ -244,6 +245,7 @@ def make_server(
 async def proxy(
     downstream_reader: asyncio.StreamReader,
     downstream_writer: asyncio.StreamWriter,
+    listening_port: int,
     upstream: Address,
     mode: Mode,
     repeat: bool,
@@ -255,7 +257,12 @@ async def proxy(
 
     downstream_ip = downstream_writer.get_extra_info("peername")
     uuid = id(downstream_writer)
-    LOG.debug("[%s] Incoming connection from %s:%s", uuid, *downstream_ip)
+    clean_upstream = str(upstream)
+    if __debug__:
+        assert clean_upstream.startswith('//')
+    clean_upstream = clean_upstream[2:]
+    log_id = f'{uuid}|{listening_port}|{clean_upstream}'
+    LOG.debug("[%s] Incoming connection from %s:%s", log_id, *downstream_ip)
 
     try:
         upstream_reader, upstream_writer = await asyncio.wait_for(
@@ -294,14 +301,14 @@ async def proxy(
             pp_result = None
             LOG.info(
                 "[%s] Invalid PROXY protocol header",
-                uuid,
+                log_id,
             )
             LOG.info(err)
 
         if pp_result is not None and is_valid_ip_port(pp_result.source):
             source_ip, _ = pp_result.source
             if is_source_ip_allowed(source_ip, allowed_addresses, allowed_ip_networks):
-                LOG.info("[%s] Real ip allowed: %s", uuid, source_ip)
+                LOG.info("[%s] Real ip allowed: %s", log_id, source_ip)
 
                 if repeat:
                     upstream_writer.write(pp.pack(pp_result))
@@ -316,7 +323,7 @@ async def proxy(
                 backward_pipe = pipe(upstream_reader, downstream_writer, timeout)
                 await asyncio.gather(backward_pipe, forward_pipe)
             else:
-                LOG.info("[%s] Real ip forbidden: %s", uuid, source_ip)
+                LOG.info("[%s] Real ip forbidden: %s", log_id, source_ip)
 
         await asyncio.sleep(0.1)  # wait for writes to actually drain
 
@@ -327,7 +334,7 @@ async def proxy(
             except (ConnectionAbortedError, BrokenPipeError):
                 pass
 
-    LOG.debug("[%s] Closed connection from %s:%s", uuid, *downstream_ip)
+    LOG.debug("[%s] Closed connection from %s:%s", log_id, *downstream_ip)
 
 
 def is_valid_ip_port(
