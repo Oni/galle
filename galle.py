@@ -259,9 +259,9 @@ async def proxy(
     uuid = id(downstream_writer)
     clean_upstream = str(upstream)
     if __debug__:
-        assert clean_upstream.startswith('//')
+        assert clean_upstream.startswith("//")
     clean_upstream = clean_upstream[2:]
-    log_id = f'{uuid}|{listening_port}|{clean_upstream}'
+    log_id = f"{uuid}|{listening_port}|{clean_upstream}"
     LOG.debug("[%s] Incoming connection from %s:%s", log_id, *downstream_ip)
 
     try:
