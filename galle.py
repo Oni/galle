@@ -16,6 +16,7 @@ import time
 
 from proxyprotocol.server import Address
 from proxyprotocol.reader import ProxyProtocolReader
+from proxyprotocol import ProxyProtocol
 from proxyprotocol.v1 import ProxyProtocolV1
 from proxyprotocol.v2 import ProxyProtocolV2
 
@@ -121,6 +122,33 @@ async def main() -> int:
             return 1
 
         try:
+            reject_action = config.get(section, "on_reject")
+        except configparser.NoOptionError:
+            print(
+                f"Invalid config file: missing 'on_reject' option in [{section}] section"
+            )
+            return 1
+        if reject_action.lower() == "drop":
+            reject_upstream = ""
+        else:
+            if not reject_action.lower().startswith("redirect:"):
+                print(
+                    f"Invalid config file: 'on_reject' option in [{section}] section must be "
+                    "'drop' or 'redirect:<some_upstream>'"
+                )
+                return 1
+            else:
+                reject_upstream = (
+                    reject_action.lower().replace("redirect:", "", 1).strip()
+                )
+                if not reject_upstream:
+                    print(
+                        f"Invalid config file: 'on_reject' option in [{section}] section has an "
+                        "empty upstream. Use 'drop' if you want to drop the rejected connections"
+                    )
+                    return 1
+
+        try:
             repeat_s = config.get(section, "repeat")
         except configparser.NoOptionError:
             print(
@@ -165,12 +193,28 @@ async def main() -> int:
             return 1
 
         configs.append(
-            (mode, repeat, upstream, listening_port, allowed_hosts, allowed_ips)
+            (
+                mode,
+                repeat,
+                upstream,
+                reject_upstream,
+                listening_port,
+                allowed_hosts,
+                allowed_ips,
+            )
         )
 
     loop = asyncio.get_event_loop()
     forevers = []
-    for mode, repeat, upstream, listening_port, allowed_hosts, allowed_ips in configs:
+    for (
+        mode,
+        repeat,
+        upstream,
+        reject_upstream,
+        listening_port,
+        allowed_hosts,
+        allowed_ips,
+    ) in configs:
         allowed_addresses = [Address(x) for x in allowed_hosts]
         allowed_ip_networks = []
         for allowed_ip in allowed_ips:
@@ -186,6 +230,7 @@ async def main() -> int:
             server = await make_server(
                 listening_port,
                 Address(upstream),
+                Address(reject_upstream) if reject_upstream else None,
                 mode,
                 repeat,
                 allowed_addresses,
@@ -220,6 +265,7 @@ async def main() -> int:
 def make_server(
     listening_port: int,
     upstream: Address,
+    reject_upstream: Address | None,
     mode: Mode,
     repeat: bool,
     allowed_addresses: List[Address],
@@ -233,6 +279,7 @@ def make_server(
         proxy,
         listening_port=listening_port,
         upstream=upstream,
+        reject_upstream=reject_upstream,
         mode=mode,
         repeat=repeat,
         allowed_addresses=allowed_addresses,
@@ -247,6 +294,7 @@ async def proxy(
     downstream_writer: asyncio.StreamWriter,
     listening_port: int,
     upstream: Address,
+    reject_upstream: Address | None,
     mode: Mode,
     repeat: bool,
     allowed_addresses: List[Address],
@@ -254,85 +302,96 @@ async def proxy(
     inactivity_timeout: float,
 ) -> None:
     """Handle the incoming connection."""
+    open_writers: tuple[asyncio.StreamWriter, ...] = (
+        downstream_writer,
+    )  # used to close them later
 
     downstream_ip = downstream_writer.get_extra_info("peername")
     uuid = id(downstream_writer)
-    clean_upstream = str(upstream)
-    if __debug__:
-        assert clean_upstream.startswith("//")
-    clean_upstream = clean_upstream[2:]
-    log_id = f"{uuid}|{listening_port}|{clean_upstream}"
+    log_id = f"{uuid}|{listening_port}|{pretty_hostname(upstream)}"
     LOG.debug("[%s] Incoming connection from %s:%s", log_id, *downstream_ip)
 
+    pp: ProxyProtocol = {
+        Mode.PP_V1: ProxyProtocolV1,
+        Mode.PP_V2: ProxyProtocolV2,
+    }[mode]()
+
+    header_reader = ProxyProtocolReader(pp)
     try:
-        upstream_reader, upstream_writer = await asyncio.wait_for(
-            asyncio.open_connection(upstream.host, upstream.port),
-            UPSTREAM_CONNECTION_TIMEOUT,
+        pp_result = await header_reader.read(downstream_reader)
+    except Exception as err:
+        LOG.info(
+            "[%s] Invalid PROXY protocol header",
+            log_id,
         )
-    except asyncio.TimeoutError:
-        LOG.error("Failed to connect upstream: timed out")
-        downstream_writer.close()
-    except ConnectionRefusedError as err:
-        LOG.error("Failed to connect upstream: connection refused")
-        LOG.error(err.strerror)
-        downstream_writer.close()
-    except socket.gaierror as err:
-        LOG.error(
-            "Failed to connect upstream: unable to reach hostname %s", upstream.host
-        )
-        LOG.error(err.strerror)
-        downstream_writer.close()
-    except OSError as err:
-        LOG.error(
-            "Failed to connect upstream: probably trying to connect to an https server"
-        )
-        LOG.error(err.strerror)
-        downstream_writer.close()
+        LOG.info(err)
     else:
-        pp: ProxyProtocolV1 | ProxyProtocolV2 = {
-            Mode.PP_V1: ProxyProtocolV1,
-            Mode.PP_V2: ProxyProtocolV2,
-        }[mode]()
-
-        header_reader = ProxyProtocolReader(pp)
-        try:
-            pp_result = await header_reader.read(downstream_reader)
-        except Exception as err:
-            pp_result = None
-            LOG.info(
-                "[%s] Invalid PROXY protocol header",
-                log_id,
-            )
-            LOG.info(err)
-
-        if pp_result is not None and is_valid_ip_port(pp_result.source):
+        if is_valid_ip_port(pp_result.source):
             source_ip, _ = pp_result.source
             if is_source_ip_allowed(source_ip, allowed_addresses, allowed_ip_networks):
                 LOG.info("[%s] Real ip allowed: %s", log_id, source_ip)
-
-                if repeat:
-                    upstream_writer.write(pp.pack(pp_result))
-                    await upstream_writer.drain()
-
-                """The idea here is to have a shared timeout among the pipes. Every time any pipe
-                receives some data, the timeout is 'reset' and waits more time on both pipes.
-                """
-                timeout = InactivityTimeout(inactivity_timeout)
-
-                forward_pipe = pipe(downstream_reader, upstream_writer, timeout)
-                backward_pipe = pipe(upstream_reader, downstream_writer, timeout)
-                await asyncio.gather(backward_pipe, forward_pipe)
+                target_upstream = upstream
             else:
-                LOG.info("[%s] Real ip forbidden: %s", log_id, source_ip)
+                if reject_upstream is None:
+                    LOG.info("[%s] Real ip forbidden (drop): %s", log_id, source_ip)
+                    target_upstream = None
+                else:
+                    LOG.info(
+                        "[%s] Real ip forbidden (redirect to %s): %s",
+                        log_id,
+                        pretty_hostname(reject_upstream),
+                        source_ip,
+                    )
+                    target_upstream = reject_upstream
 
-        await asyncio.sleep(0.1)  # wait for writes to actually drain
+            if target_upstream is not None:
+                try:
+                    upstream_reader, upstream_writer = await asyncio.wait_for(
+                        asyncio.open_connection(
+                            target_upstream.host, target_upstream.port
+                        ),
+                        UPSTREAM_CONNECTION_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    LOG.error("Failed to connect upstream: timed out")
+                except ConnectionRefusedError as err:
+                    LOG.error("Failed to connect upstream: connection refused")
+                    LOG.error(err.strerror)
+                except socket.gaierror as err:
+                    LOG.error(
+                        "Failed to connect upstream: unable to reach hostname %s",
+                        upstream.host,
+                    )
+                    LOG.error(err.strerror)
+                except OSError as err:
+                    LOG.error(
+                        "Failed to connect upstream: probably trying to connect to an https server"
+                    )
+                    LOG.error(err.strerror)
+                else:
+                    open_writers += (downstream_writer,)
+                    if repeat:
+                        upstream_writer.write(pp.pack(pp_result))
+                        await upstream_writer.drain()
 
-        for writer in (downstream_writer, upstream_writer):
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except (ConnectionAbortedError, BrokenPipeError):
-                pass
+                    """The idea here is to have a shared timeout among the pipes. Every time any
+                    pipe receives some data, the timeout is 'reset' and waits more time on both
+                    pipes.
+                    """
+                    timeout = InactivityTimeout(inactivity_timeout)
+
+                    forward_pipe = pipe(downstream_reader, upstream_writer, timeout)
+                    backward_pipe = pipe(upstream_reader, downstream_writer, timeout)
+                    await asyncio.gather(backward_pipe, forward_pipe)
+
+                    await asyncio.sleep(0.1)  # wait for writes to actually drain
+
+    for writer in open_writers:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (ConnectionAbortedError, BrokenPipeError):
+            pass
 
     LOG.debug("[%s] Closed connection from %s:%s", log_id, *downstream_ip)
 
@@ -345,6 +404,13 @@ def is_valid_ip_port(
 ) -> TypeGuard[Tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]]:
     """Provide a TypeGuard for ProxyProtocolReader.read() result."""
     return isinstance(source, tuple)
+
+
+def pretty_hostname(address: Address) -> str:
+    str_address = str(address)
+    if __debug__:
+        assert str_address.startswith("//")
+    return str_address[2:]
 
 
 def is_source_ip_allowed(

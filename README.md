@@ -8,6 +8,8 @@ It supports generic tcp filtering using "PROXY protocol" to get information on t
 
 The general idea is that this proxy will listen to a user defined list of ports and will forward only whitelisted ips/hostnames to upstream. Each port is "mapped" to a specific upstream.
 
+Rejected connections can be simply dropped or redirected to a different upstream.
+
 ## Usage
 
     python galle.py <path to ini config file>
