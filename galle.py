@@ -387,6 +387,9 @@ async def proxy(
                     await asyncio.sleep(0.1)  # wait for writes to actually drain
 
     for writer in open_writers:
+        if writer.can_write_eof():
+            writer.write_eof()
+
         writer.close()
         try:
             await writer.wait_closed()
