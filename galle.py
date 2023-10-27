@@ -369,7 +369,7 @@ async def proxy(
                     )
                     LOG.error(err.strerror)
                 else:
-                    open_writers += (downstream_writer,)
+                    open_writers += (upstream_writer,)
                     if repeat:
                         upstream_writer.write(pp.pack(pp_result))
                         await upstream_writer.drain()
