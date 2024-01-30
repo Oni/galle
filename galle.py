@@ -388,7 +388,10 @@ async def proxy(
 
     for writer in open_writers:
         if writer.can_write_eof():
-            writer.write_eof()
+            try:
+                writer.write_eof()
+            except OSError:  # Socket not connected
+                pass  # we don't really care: connection is lost
 
         writer.close()
         try:
