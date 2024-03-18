@@ -24,6 +24,7 @@ from proxyprotocol.v2 import ProxyProtocolV2
 LOG = logging.getLogger(__name__)
 BUFFER_LEN = 1024
 UPSTREAM_CONNECTION_TIMEOUT = 5  # seconds
+BANNED_IPS: List[BannedIp] = []  # global list of banned ips
 
 
 class Mode(Enum):
@@ -74,6 +75,18 @@ async def main() -> int:
         inactivity_timeout = float(inactivity_timeout_s)
     except ValueError:
         print("Invalid config file: the 'inactivity_timeout' must be an int or a float")
+        return 1
+
+    try:
+        ban_requests_port_s = config.get("general", "ban_requests_port")
+        # configparser.NoSectionError eventually raised by previous option query
+    except configparser.NoOptionError:
+        print("Invalid config file: no 'ban_requests_port' option in [general] section")
+        return 1
+    try:
+        ban_requests_port = int(ban_requests_port_s)
+    except ValueError:
+        print("Invalid config file: the 'ban_requests_port' must be an int")
         return 1
 
     try:
@@ -206,6 +219,8 @@ async def main() -> int:
 
     loop = asyncio.get_event_loop()
     forevers = []
+
+    # init proxies
     for (
         mode,
         repeat,
@@ -255,6 +270,28 @@ async def main() -> int:
                 pass
 
             forevers.append(forever)
+
+    # init ban request listener
+    if ban_requests_port != -1:
+        try:
+            ban_listener = await make_ban_listener(ban_requests_port)
+        except OSError as err:
+            LOG.error(
+                "Unable to run ban request listener at local port %s", ban_requests_port
+            )
+            LOG.error(err.strerror)
+        else:
+            forever = asyncio.create_task(ban_listener.serve_forever())
+            LOG.info("Started serving ban listener at local port %s", ban_requests_port)
+            try:
+                loop.add_signal_handler(signal.SIGINT, forever.cancel)
+                loop.add_signal_handler(signal.SIGTERM, forever.cancel)
+            except NotImplementedError:
+                # windows
+                pass
+    else:
+        LOG.info("Skipping creation of ban request listener")
+
     try:
         await asyncio.gather(*forevers)
     except asyncio.CancelledError:
@@ -328,21 +365,44 @@ async def proxy(
     else:
         if is_valid_ip_port(pp_result.source):
             source_ip, _ = pp_result.source
-            if is_source_ip_allowed(source_ip, allowed_addresses, allowed_ip_networks):
-                LOG.info("[%s] Real ip allowed: %s", log_id, source_ip)
-                target_upstream = upstream
-            else:
-                if reject_upstream is None:
-                    LOG.info("[%s] Real ip forbidden (drop): %s", log_id, source_ip)
-                    target_upstream = None
-                else:
+
+            # drop banned ips
+            for banned_ip in BANNED_IPS[
+                :
+            ]:  # make a copy: we change BANNED_IPS as we go
+                if not banned_ip.still_banned():
+                    BANNED_IPS.remove(banned_ip)
                     LOG.info(
-                        "[%s] Real ip forbidden (redirect to %s): %s",
-                        log_id,
-                        pretty_hostname(reject_upstream),
-                        source_ip,
+                        "Lifting ban for %s (expired at %s)",
+                        banned_ip.ip,
+                        banned_ip.formatted_ban_end_time(),
                     )
-                    target_upstream = reject_upstream
+                    continue
+                else:
+                    if source_ip == banned_ip.ip:
+                        LOG.info("[%s] Real ip banned: %s", log_id, source_ip)
+                        target_upstream = None
+                        break
+            else:
+                # break never occurred: check the whitelist
+
+                if is_source_ip_allowed(
+                    source_ip, allowed_addresses, allowed_ip_networks
+                ):
+                    LOG.info("[%s] Real ip allowed: %s", log_id, source_ip)
+                    target_upstream = upstream
+                else:
+                    if reject_upstream is None:
+                        LOG.info("[%s] Real ip forbidden (drop): %s", log_id, source_ip)
+                        target_upstream = None
+                    else:
+                        LOG.info(
+                            "[%s] Real ip forbidden (redirect to %s): %s",
+                            log_id,
+                            pretty_hostname(reject_upstream),
+                            source_ip,
+                        )
+                        target_upstream = reject_upstream
 
             if target_upstream is not None:
                 try:
@@ -386,20 +446,129 @@ async def proxy(
 
                     await asyncio.sleep(0.1)  # wait for writes to actually drain
 
-    for writer in open_writers:
-        if writer.can_write_eof():
-            try:
-                writer.write_eof()
-            except OSError:  # Socket not connected
-                pass  # we don't really care: connection is lost
-
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except (ConnectionAbortedError, BrokenPipeError):
-            pass
+    for open_writer in open_writers:
+        await close_write_stream(open_writer)
 
     LOG.debug("[%s] Closed connection from %s:%s", log_id, *downstream_ip)
+
+
+def make_ban_listener(
+    listening_port: int,
+) -> Coroutine:
+    address = Address(f"0.0.0.0:{listening_port}")
+    return asyncio.start_server(process_ban_request, address.host, address.port)
+
+
+async def process_ban_request(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+) -> None:
+    """Given a connection, try to parse it into a proper ban. Write back an empty response in the
+    write stream.
+    """
+
+    ban_request = await read_ban_request(reader)
+    if ban_request:
+        banned_ip = ban_request_to_banned_ip(ban_request)
+        if banned_ip is not None:
+            BANNED_IPS.append(banned_ip)
+            LOG.info(
+                "Ban request accepted for ip %s until %s",
+                banned_ip.ip,
+                banned_ip.formatted_ban_end_time(),
+            )
+
+    await close_write_stream(writer)
+
+
+async def read_ban_request(reader: asyncio.StreamReader) -> str:
+    """Read the stream and return the very last line (stripped). The expected data is:
+    <HTTP header stuff here: ignored>
+    <empty line>
+    <last line that will be returned stripped>
+
+    If anything fails, return an empty string.
+    """
+    data = b""
+    try:
+        while not reader.at_eof():
+            data += await asyncio.wait_for(
+                reader.read(BUFFER_LEN), UPSTREAM_CONNECTION_TIMEOUT
+            )
+            if data.endswith(b"EOF"):
+                break
+    except asyncio.TimeoutError:
+        pass
+
+    try:
+        request = data.decode("utf-8")
+    except UnicodeDecodeError:
+        LOG.error("Could not decode ban request in UTF-8")
+        return ""
+
+    request_lines = request.splitlines()
+
+    try:
+        if request_lines[-2].strip() != "":
+            LOG.error(
+                "Badly formatted ban request: request body is empty or has too many lines"
+            )
+            return ""
+    except IndexError:
+        LOG.error("Badly formatted ban request: not enough lines")
+        return ""
+
+    return request_lines[-1].strip()
+
+
+def ban_request_to_banned_ip(ban_request: str) -> BannedIp | None:
+    """Given a ban request, translate it to a BannedIp object if possible. We expect a string like:
+    <ip to ban, v4 or v6> <ban duration as an int, in seconds><possibly a space>EOF
+
+    If anything fails, return None.
+    """
+
+    if not ban_request.endswith("EOF"):
+        LOG.error("Ban request '%s' doesn't end with 'EOF' string", ban_request)
+        return None
+
+    try:
+        ip_to_ban_s, ban_duration_s = ban_request[
+            :-3
+        ].split()  # -3 because we cut 'EOF'
+    except ValueError:
+        LOG.error("Could not unpack ban request '%s'", ban_request)
+        return None
+
+    try:
+        ip_to_ban = ipaddress.ip_address(ip_to_ban_s)
+    except ValueError:
+        LOG.error("Invalid ip '%s'", ip_to_ban_s)
+        return None
+
+    try:
+        ban_duration = int(ban_duration_s)
+    except ValueError:
+        LOG.error("Invalid duration '%s'", ban_duration_s)
+        return None
+
+    ban_end_time = time.time() + ban_duration
+    return BannedIp(ip_to_ban, ban_end_time)
+
+
+async def close_write_stream(writer: asyncio.StreamWriter) -> None:
+    """Gracefully close the writer stream."""
+    if writer.can_write_eof():
+        try:
+            writer.write_eof()
+        except OSError:  # Socket not connected
+            pass  # connection is lost, but we don't really care
+
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except (ConnectionAbortedError, BrokenPipeError):
+        pass
 
 
 def is_valid_ip_port(
@@ -470,7 +639,7 @@ class InactivityTimeout:
     This Object handles shared pipe timeout.
     """
 
-    def __init__(self, timeout):
+    def __init__(self, timeout: float):
         """
         The remaining time until timeout is prolonged every time we 'awake()' this
         InactivityTimeout.
@@ -490,6 +659,26 @@ class InactivityTimeout:
         now = time.time()
         remaining = self.last_awake + self.timeout - now
         return max(remaining, 0)
+
+
+class BannedIp:
+    """
+    This object wraps an ip ban.
+    """
+
+    def __init__(
+        self, ip: ipaddress.IPv4Address | ipaddress.IPv6Address, ban_end_time: float
+    ):
+        self.ip = ip
+        self._ban_end_time = ban_end_time
+
+    def still_banned(self) -> bool:
+        now = time.time()
+        return now < self._ban_end_time
+
+    def formatted_ban_end_time(self) -> str:
+        local_time = time.localtime(self._ban_end_time)
+        return time.strftime("%Y-%m-%d %H:%M:%S", local_time)
 
 
 def decode_data_for_logging(data: bytes) -> str:
