@@ -253,12 +253,12 @@ async def main() -> int:
                 inactivity_timeout,
             )
         except OSError as err:
-            LOG.error("Unable to run http proxy at local port %s", listening_port)
+            LOG.error("Unable to run tcp proxy at local port %s", listening_port)
             LOG.error(err.strerror)
         else:
             forever = asyncio.create_task(server.serve_forever())
             LOG.info(
-                "Started serving http proxy at local port %s that will forward traffic to %s",
+                "Started serving tcp proxy at local port %s that will forward traffic to %s",
                 listening_port,
                 upstream,
             )
