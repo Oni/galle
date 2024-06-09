@@ -424,7 +424,12 @@ def is_source_ip_allowed(
     allowed_addresses: List[Address],
     allowed_ip_networks: List[ipaddress.IPv4Network],
 ) -> bool:
-    # check by hostname
+    # first: check by ip (faster)
+    for allowed_ip_network in allowed_ip_networks:
+        if source_ip in allowed_ip_network:
+            return True
+
+    # second: check by hostname (slower)
     for allowed_address in allowed_addresses:
         try:
             allowed_hostname = allowed_address.host
@@ -438,11 +443,6 @@ def is_source_ip_allowed(
         else:
             if source_ip == allowed_ip:
                 return True
-
-    # check by ip
-    for allowed_ip_network in allowed_ip_networks:
-        if source_ip in allowed_ip_network:
-            return True
 
     return False
 
