@@ -31,6 +31,140 @@ class Mode(Enum):
     PP_V2 = 2
 
 
+class Rule:
+    def __init__(self, config: configparser.ConfigParser, section: str):
+        try:
+            self.port = int(section)
+        except ValueError as err:
+            raise ValueError(
+                "Invalid config file: the section name (the port we want to listen "
+                "to) must be an int"
+            ) from err
+
+        available_modes = {
+            "pp_v1": Mode.PP_V1,
+            "pp_v2": Mode.PP_V2,
+        }
+        try:
+            mode_s = config.get(section, "mode")
+        except configparser.NoOptionError as err:
+            raise ValueError(
+                f"Invalid config file: missing 'mode' option in [{section}] section"
+            ) from err
+        try:
+            self.pp_mode = available_modes[mode_s]
+        except KeyError as err:
+            raise ValueError(
+                f"Invalid config file: 'mode' option in [{section}] section must be one of 'pp_v1' "
+                "or 'pp_v2'"
+            ) from err
+
+        self.reject_upstream: Address | None
+        try:
+            reject_action = config.get(section, "on_reject")
+        except configparser.NoOptionError as err:
+            raise ValueError(
+                f"Invalid config file: missing 'on_reject' option in [{section}] section"
+            ) from err
+        if reject_action.lower() == "drop":
+            self.reject_upstream = None
+        else:
+            if not reject_action.lower().startswith("redirect:"):
+                raise ValueError(
+                    f"Invalid config file: 'on_reject' option in [{section}] section must be "
+                    "'drop' or 'redirect:<some_upstream>'"
+                )
+            else:
+                reject_upstream_s = (
+                    reject_action.lower().replace("redirect:", "", 1).strip()
+                )
+                if not reject_upstream_s:
+                    raise ValueError(
+                        f"Invalid config file: 'on_reject' option in [{section}] section has an "
+                        "empty upstream. Use 'drop' if you want to drop the rejected connections"
+                    )
+                self.reject_upstream = Address(reject_upstream_s)
+
+        try:
+            repeat_s = config.get(section, "repeat")
+        except configparser.NoOptionError as err:
+            raise ValueError(
+                f"Invalid config file: missing 'repeat' option in [{section}] section"
+            ) from err
+        try:
+            self.repeat_pp = {"true": True, "false": False}[repeat_s.lower()]
+        except KeyError as err:
+            raise ValueError(
+                f"Invalid config file: 'repeat' option in [{section}] section must be 'true' or "
+                "'false'"
+            ) from err
+
+        try:
+            self.upstream = Address(config.get(section, "upstream"))
+        except configparser.NoOptionError as err:
+            raise ValueError(
+                f"Invalid config file: missing 'upstream' option in [{section}] section"
+            ) from err
+
+        try:
+            allowed_hosts = [
+                x.strip() for x in config.get(section, "allowed_hosts").split(",")
+            ]
+        except configparser.NoOptionError as err:
+            raise ValueError(
+                f"Invalid config file: missing 'allowed_hosts' option in [{section}] section"
+            ) from err
+
+        try:
+            allowed_ips = [
+                x.strip() for x in config.get(section, "allowed_ips").split(",")
+            ]
+        except configparser.NoOptionError as err:
+            raise ValueError(
+                f"Invalid config file: missing 'allowed_ips' option in [{section}] section"
+            ) from err
+
+        self.allowed_addresses = [Address(x) for x in allowed_hosts]
+        self.allowed_ip_networks: List[
+            ipaddress.IPv4Network | ipaddress.IPv6Network
+        ] = []
+        for allowed_ip in allowed_ips:
+            try:
+                self.allowed_ip_networks.append(ipaddress.ip_network(allowed_ip))
+            except ValueError as err:
+                raise ValueError(
+                    f"Unable to translate {allowed_ip} to a valid ip range in [{section}] section"
+                ) from err
+
+    def is_source_ip_allowed(
+        self,
+        source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    ) -> bool:
+        # first: check by ip (faster)
+        for allowed_ip_network in self.allowed_ip_networks:
+            if source_ip in allowed_ip_network:
+                return True
+
+        # second: check by hostname (slower)
+        for allowed_address in self.allowed_addresses:
+            try:
+                allowed_hostname = allowed_address.host
+                allowed_ip = ipaddress.ip_address(
+                    socket.gethostbyname(allowed_hostname)
+                )
+            except socket.gaierror as err:
+                LOG.info(
+                    "Unable to resolve allowed host %s",
+                    allowed_hostname,
+                )
+                LOG.info(err.strerror)
+            else:
+                if source_ip == allowed_ip:
+                    return True
+
+        return False
+
+
 async def main() -> int:
     """The main function: gather() all servers listed in config."""
     parser = ArgumentParser(
@@ -92,160 +226,31 @@ async def main() -> int:
 
     logging.basicConfig(level=log_level, format="%(asctime)-15s %(name)s %(message)s")
 
-    configs = []
+    rules = []
     for section in [x for x in config.sections() if x != "general"]:
         try:
-            listening_port = int(section)
-        except ValueError:
-            print(
-                "Invalid config file: the section name (the port we want to listen to) must be an "
-                "int"
-            )
+            rules.append(Rule(config, section))
+        except ValueError as e:
+            print(e.args[0])
             return 1
-
-        available_modes = {
-            "pp_v1": Mode.PP_V1,
-            "pp_v2": Mode.PP_V2,
-        }
-        try:
-            mode_s = config.get(section, "mode")
-        except configparser.NoOptionError:
-            print(f"Invalid config file: missing 'mode' option in [{section}] section")
-            return 1
-        try:
-            mode = available_modes[mode_s]
-        except KeyError:
-            print(
-                f"Invalid config file: 'mode' option in [{section}] section must be one of 'pp_v1' "
-                "or 'pp_v2'"
-            )
-            return 1
-
-        try:
-            reject_action = config.get(section, "on_reject")
-        except configparser.NoOptionError:
-            print(
-                f"Invalid config file: missing 'on_reject' option in [{section}] section"
-            )
-            return 1
-        if reject_action.lower() == "drop":
-            reject_upstream = ""
-        else:
-            if not reject_action.lower().startswith("redirect:"):
-                print(
-                    f"Invalid config file: 'on_reject' option in [{section}] section must be "
-                    "'drop' or 'redirect:<some_upstream>'"
-                )
-                return 1
-            else:
-                reject_upstream = (
-                    reject_action.lower().replace("redirect:", "", 1).strip()
-                )
-                if not reject_upstream:
-                    print(
-                        f"Invalid config file: 'on_reject' option in [{section}] section has an "
-                        "empty upstream. Use 'drop' if you want to drop the rejected connections"
-                    )
-                    return 1
-
-        try:
-            repeat_s = config.get(section, "repeat")
-        except configparser.NoOptionError:
-            print(
-                f"Invalid config file: missing 'repeat' option in [{section}] section"
-            )
-            return 1
-        try:
-            repeat = {"true": True, "false": False}[repeat_s.lower()]
-        except KeyError:
-            print(
-                f"Invalid config file: 'repeat' option in [{section}] section must be 'true' or "
-                "'false'"
-            )
-            return 1
-
-        try:
-            upstream = config.get(section, "upstream")
-        except configparser.NoOptionError:
-            print(
-                f"Invalid config file: missing 'upstream' option in [{section}] section"
-            )
-            return 1
-
-        try:
-            allowed_hosts = [
-                x.strip() for x in config.get(section, "allowed_hosts").split(",")
-            ]
-        except configparser.NoOptionError:
-            print(
-                f"Invalid config file: missing 'allowed_hosts' option in [{section}] section"
-            )
-            return 1
-
-        try:
-            allowed_ips = [
-                x.strip() for x in config.get(section, "allowed_ips").split(",")
-            ]
-        except configparser.NoOptionError:
-            print(
-                f"Invalid config file: missing 'allowed_ips' option in [{section}] section"
-            )
-            return 1
-
-        configs.append(
-            (
-                mode,
-                repeat,
-                upstream,
-                reject_upstream,
-                listening_port,
-                allowed_hosts,
-                allowed_ips,
-            )
-        )
 
     loop = asyncio.get_event_loop()
     forevers = []
-    for (
-        mode,
-        repeat,
-        upstream,
-        reject_upstream,
-        listening_port,
-        allowed_hosts,
-        allowed_ips,
-    ) in configs:
-        allowed_addresses = [Address(x) for x in allowed_hosts]
-        allowed_ip_networks = []
-        for allowed_ip in allowed_ips:
-            try:
-                allowed_ip_networks.append(ipaddress.ip_network(allowed_ip))
-            except ValueError as err:
-                LOG.error(
-                    "Unable to translate %s to a valid ip range: skipping", allowed_ip
-                )
-                LOG.error(err.args[0])
-
+    for rule in rules:
         try:
             server = await make_server(
-                listening_port,
-                Address(upstream),
-                Address(reject_upstream) if reject_upstream else None,
-                mode,
-                repeat,
-                allowed_addresses,
-                allowed_ip_networks,
+                rule,
                 inactivity_timeout,
             )
         except OSError as err:
-            LOG.error("Unable to run http proxy at local port %s", listening_port)
+            LOG.error("Unable to run http proxy at local port %s", rule.port)
             LOG.error(err.strerror)
         else:
             forever = asyncio.create_task(server.serve_forever())
             LOG.info(
                 "Started serving http proxy at local port %s that will forward traffic to %s",
-                listening_port,
-                upstream,
+                rule.port,
+                pretty_hostname(rule.upstream),
             )
             try:
                 loop.add_signal_handler(signal.SIGINT, forever.cancel)
@@ -263,27 +268,15 @@ async def main() -> int:
 
 
 def make_server(
-    listening_port: int,
-    upstream: Address,
-    reject_upstream: Address | None,
-    mode: Mode,
-    repeat: bool,
-    allowed_addresses: List[Address],
-    allowed_ip_networks: List[ipaddress.IPv4Network | ipaddress.IPv6Network],
+    rule: Rule,
     inactivity_timeout: float,
 ) -> Coroutine:
     """Return a server that needs to be awaited."""
 
-    address = Address(f"0.0.0.0:{listening_port}")
+    address = Address(f"0.0.0.0:{rule.port}")
     proxy_partial = partial(
         proxy,
-        listening_port=listening_port,
-        upstream=upstream,
-        reject_upstream=reject_upstream,
-        mode=mode,
-        repeat=repeat,
-        allowed_addresses=allowed_addresses,
-        allowed_ip_networks=allowed_ip_networks,
+        rule=rule,
         inactivity_timeout=inactivity_timeout,
     )
     return asyncio.start_server(proxy_partial, address.host, address.port)
@@ -292,13 +285,7 @@ def make_server(
 async def proxy(
     downstream_reader: asyncio.StreamReader,
     downstream_writer: asyncio.StreamWriter,
-    listening_port: int,
-    upstream: Address,
-    reject_upstream: Address | None,
-    mode: Mode,
-    repeat: bool,
-    allowed_addresses: List[Address],
-    allowed_ip_networks: List[ipaddress.IPv4Network],
+    rule: Rule,
     inactivity_timeout: float,
 ) -> None:
     """Handle the incoming connection."""
@@ -308,13 +295,13 @@ async def proxy(
 
     downstream_ip = downstream_writer.get_extra_info("peername")
     uuid = id(downstream_writer)
-    log_id = f"{uuid}|{listening_port}|{pretty_hostname(upstream)}"
+    log_id = f"{uuid}|{rule.port}|{pretty_hostname(rule.upstream)}"
     LOG.debug("[%s] Incoming connection from %s:%s", log_id, *downstream_ip)
 
     pp: ProxyProtocol = {
         Mode.PP_V1: ProxyProtocolV1,
         Mode.PP_V2: ProxyProtocolV2,
-    }[mode]()
+    }[rule.pp_mode]()
 
     header_reader = ProxyProtocolReader(pp)
     try:
@@ -328,21 +315,21 @@ async def proxy(
     else:
         if is_valid_ip_port(pp_result.source):
             source_ip, _ = pp_result.source
-            if is_source_ip_allowed(source_ip, allowed_addresses, allowed_ip_networks):
+            if rule.is_source_ip_allowed(source_ip):
                 LOG.info("[%s] Real ip allowed: %s", log_id, source_ip)
-                target_upstream = upstream
+                target_upstream = rule.upstream
             else:
-                if reject_upstream is None:
+                if rule.reject_upstream is None:
                     LOG.info("[%s] Real ip forbidden (drop): %s", log_id, source_ip)
                     target_upstream = None
                 else:
                     LOG.info(
                         "[%s] Real ip forbidden (redirect to %s): %s",
                         log_id,
-                        pretty_hostname(reject_upstream),
+                        pretty_hostname(rule.reject_upstream),
                         source_ip,
                     )
-                    target_upstream = reject_upstream
+                    target_upstream = rule.reject_upstream
 
             if target_upstream is not None:
                 try:
@@ -360,7 +347,7 @@ async def proxy(
                 except socket.gaierror as err:
                     LOG.error(
                         "Failed to connect upstream: unable to reach hostname %s",
-                        upstream.host,
+                        rule.upstream.host,
                     )
                     LOG.error(err.strerror)
                 except OSError as err:
@@ -370,7 +357,7 @@ async def proxy(
                     LOG.error(err.strerror)
                 else:
                     open_writers += (upstream_writer,)
-                    if repeat:
+                    if rule.repeat_pp:
                         upstream_writer.write(pp.pack(pp_result))
                         await upstream_writer.drain()
 
@@ -417,34 +404,6 @@ def pretty_hostname(address: Address) -> str:
     if __debug__:
         assert str_address.startswith("//")
     return str_address[2:]
-
-
-def is_source_ip_allowed(
-    source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
-    allowed_addresses: List[Address],
-    allowed_ip_networks: List[ipaddress.IPv4Network],
-) -> bool:
-    # first: check by ip (faster)
-    for allowed_ip_network in allowed_ip_networks:
-        if source_ip in allowed_ip_network:
-            return True
-
-    # second: check by hostname (slower)
-    for allowed_address in allowed_addresses:
-        try:
-            allowed_hostname = allowed_address.host
-            allowed_ip = ipaddress.ip_address(socket.gethostbyname(allowed_hostname))
-        except socket.gaierror as err:
-            LOG.info(
-                "Unable to resolve allowed host %s",
-                allowed_hostname,
-            )
-            LOG.info(err.strerror)
-        else:
-            if source_ip == allowed_ip:
-                return True
-
-    return False
 
 
 async def pipe(
