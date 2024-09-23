@@ -188,13 +188,29 @@ async def main() -> int:
     config.read(config_path)
 
     try:
-        config_log_level = config.get("general", "log_level")
+        log_level_s = config.get("general", "log_level")
     except configparser.NoSectionError:
         print("Invalid config file: no [general] section")
         return 1
     except configparser.NoOptionError:
-        print("Invalid config file: no 'level' option in [general] section")
+        print("Invalid config file: no 'log_level' option in [general] section")
         return 1
+
+    try:
+        log_level = {
+            "error": logging.ERROR,
+            "warn": logging.WARN,
+            "info": logging.INFO,
+            "debug": logging.DEBUG,
+        }[log_level_s]
+    except KeyError:
+        print(
+            "Invalid config file: 'log_level' option in [general] section must be 'error', 'warn', "
+            "'info' or 'debug'"
+        )
+        return 1
+
+    logging.basicConfig(level=log_level, format="%(asctime)-15s %(name)s %(message)s")
 
     try:
         inactivity_timeout_s = config.get("general", "inactivity_timeout")
@@ -209,22 +225,6 @@ async def main() -> int:
     except ValueError:
         print("Invalid config file: the 'inactivity_timeout' must be an int or a float")
         return 1
-
-    try:
-        log_level = {
-            "error": logging.ERROR,
-            "warn": logging.WARN,
-            "info": logging.INFO,
-            "debug": logging.DEBUG,
-        }[config_log_level]
-    except KeyError:
-        print(
-            "Invalid config file: 'log_level' option in [general] section must be 'error', 'warn', "
-            "'info' or 'debug'"
-        )
-        return 1
-
-    logging.basicConfig(level=log_level, format="%(asctime)-15s %(name)s %(message)s")
 
     rules = []
     for section in [x for x in config.sections() if x != "general"]:
