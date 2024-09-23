@@ -1,6 +1,6 @@
 # Galle
 
-A simple proxy that filters incoming connections based on request source.
+A simple tcp proxy that filters incoming connections based on request source.
 
 The proxy is written in python.
 
