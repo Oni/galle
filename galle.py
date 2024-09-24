@@ -175,34 +175,28 @@ class Rule:
             ) from err
 
         try:
-            allowed_hosts = [
-                x.strip() for x in config.get(section, "allowed_hosts").split(",")
-            ]
+            allowed_ns = [x.strip() for x in config.get(section, "allowed").split(",")]
         except configparser.NoOptionError as err:
             raise ValueError(
-                f"Invalid config file: missing 'allowed_hosts' option in [{section}] section"
+                f"Invalid config file: missing 'allowed' option in [{section}] section"
             ) from err
-
-        try:
-            allowed_ips = [
-                x.strip() for x in config.get(section, "allowed_ips").split(",")
-            ]
-        except configparser.NoOptionError as err:
-            raise ValueError(
-                f"Invalid config file: missing 'allowed_ips' option in [{section}] section"
-            ) from err
-
-        self.allowed_addresses = [Address(x) for x in allowed_hosts]
+        allowed_s = [x for x in allowed_ns if x]
+        if len(allowed_s) == 0:
+            LOG.warning(
+                "The 'allowed' option is empty in [%s] section: blocking ALL traffic",
+                section,
+            )
         self.allowed_ip_networks: List[
             ipaddress.IPv4Network | ipaddress.IPv6Network
         ] = []
-        for allowed_ip in allowed_ips:
+        self.allowed_addresses: List[Address] = []
+        for address_or_ip_network in allowed_s:
             try:
-                self.allowed_ip_networks.append(ipaddress.ip_network(allowed_ip))
-            except ValueError as err:
-                raise ValueError(
-                    f"Unable to translate {allowed_ip} to a valid ip range in [{section}] section"
-                ) from err
+                self.allowed_ip_networks.append(
+                    ipaddress.ip_network(address_or_ip_network)
+                )
+            except ValueError:
+                self.allowed_addresses.append(Address(address_or_ip_network))
 
     def is_source_ip_allowed(
         self,
