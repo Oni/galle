@@ -67,11 +67,16 @@ class General:
                 "Invalid config file: no 'inactivity_timeout' option in [general] section"
             ) from err
         try:
-            self.inactivity_timeout = float(inactivity_timeout_s)
+            inactivity_timeout_f = float(inactivity_timeout_s)
         except ValueError as err:
             raise ValueError(
                 "Invalid config file: the 'inactivity_timeout' must be an int or a float"
             ) from err
+        if inactivity_timeout_f <= 0.0:
+            raise ValueError(
+                "Invalid config file: the 'inactivity_timeout' must be higher than 0"
+            )
+        self.inactivity_timeout = inactivity_timeout_f
 
 
 class Rule:
