@@ -147,6 +147,26 @@ class Rule:
                 "'false'"
             ) from err
 
+        self.inactivity_timeout: float | None
+        try:
+            inactivity_timeout_s = config.get(section, "inactivity_timeout")
+        except configparser.NoOptionError as err:
+            self.inactivity_timeout = None
+        else:
+            try:
+                inactivity_timeout_f = float(inactivity_timeout_s)
+            except ValueError as err:
+                raise ValueError(
+                    f"Invalid config file: the 'inactivity_timeout' in [{section}] section must be "
+                    "an int or a float"
+                ) from err
+            if inactivity_timeout_f <= 0.0:
+                raise ValueError(
+                    f"Invalid config file: the 'inactivity_timeout' in [{section}] sectionmust be "
+                    "higher than 0"
+                )
+            self.inactivity_timeout = inactivity_timeout_f
+
         try:
             self.upstream = Address(config.get(section, "upstream"))
         except configparser.NoOptionError as err:
@@ -376,11 +396,14 @@ async def proxy(
                         upstream_writer.write(pp.pack(pp_result))
                         await upstream_writer.drain()
 
+                    inactivity_timeout = general.inactivity_timeout
+                    if rule.inactivity_timeout is not None:
+                        inactivity_timeout = rule.inactivity_timeout
                     """The idea here is to have a shared timeout among the pipes. Every time any
                     pipe receives some data, the timeout is 'reset' and waits more time on both
                     pipes.
                     """
-                    timeout = InactivityTimeout(general.inactivity_timeout)
+                    timeout = InactivityTimeout(inactivity_timeout)
 
                     forward_pipe = pipe(downstream_reader, upstream_writer, timeout)
                     backward_pipe = pipe(upstream_reader, downstream_writer, timeout)
