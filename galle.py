@@ -31,6 +31,49 @@ class Mode(Enum):
     PP_V2 = 2
 
 
+class General:
+    def __init__(self, config: configparser.ConfigParser):
+        try:
+            log_level_s = config.get("general", "log_level")
+        except configparser.NoSectionError as err:
+            raise ValueError("Invalid config file: no [general] section") from err
+        except configparser.NoOptionError as err:
+            raise ValueError(
+                "Invalid config file: no 'log_level' option in [general] section"
+            ) from err
+
+        try:
+            log_level = {
+                "error": logging.ERROR,
+                "warn": logging.WARN,
+                "info": logging.INFO,
+                "debug": logging.DEBUG,
+            }[log_level_s]
+        except KeyError as err:
+            raise ValueError(
+                "Invalid config file: 'log_level' option in [general] section must be 'error', "
+                "'warn', 'info' or 'debug'"
+            ) from err
+
+        logging.basicConfig(
+            level=log_level, format="%(asctime)-15s %(name)s %(message)s"
+        )
+
+        try:
+            inactivity_timeout_s = config.get("general", "inactivity_timeout")
+            # configparser.NoSectionError eventually raised by previous option query
+        except configparser.NoOptionError as err:
+            raise ValueError(
+                "Invalid config file: no 'inactivity_timeout' option in [general] section"
+            ) from err
+        try:
+            self.inactivity_timeout = float(inactivity_timeout_s)
+        except ValueError as err:
+            raise ValueError(
+                "Invalid config file: the 'inactivity_timeout' must be an int or a float"
+            ) from err
+
+
 class Rule:
     def __init__(self, config: configparser.ConfigParser, section: str):
         try:
@@ -188,50 +231,17 @@ async def main() -> int:
     config.read(config_path)
 
     try:
-        log_level_s = config.get("general", "log_level")
-    except configparser.NoSectionError:
-        print("Invalid config file: no [general] section")
-        return 1
-    except configparser.NoOptionError:
-        print("Invalid config file: no 'log_level' option in [general] section")
-        return 1
-
-    try:
-        log_level = {
-            "error": logging.ERROR,
-            "warn": logging.WARN,
-            "info": logging.INFO,
-            "debug": logging.DEBUG,
-        }[log_level_s]
-    except KeyError:
-        print(
-            "Invalid config file: 'log_level' option in [general] section must be 'error', 'warn', "
-            "'info' or 'debug'"
-        )
-        return 1
-
-    logging.basicConfig(level=log_level, format="%(asctime)-15s %(name)s %(message)s")
-
-    try:
-        inactivity_timeout_s = config.get("general", "inactivity_timeout")
-        # configparser.NoSectionError eventually raised by previous option query
-    except configparser.NoOptionError:
-        print(
-            "Invalid config file: no 'inactivity_timeout' option in [general] section"
-        )
-        return 1
-    try:
-        inactivity_timeout = float(inactivity_timeout_s)
-    except ValueError:
-        print("Invalid config file: the 'inactivity_timeout' must be an int or a float")
+        general = General(config)
+    except ValueError as err:
+        print(err.args[0])
         return 1
 
     rules = []
     for section in [x for x in config.sections() if x != "general"]:
         try:
             rules.append(Rule(config, section))
-        except ValueError as e:
-            print(e.args[0])
+        except ValueError as err:
+            print(err.args[0])
             return 1
 
     loop = asyncio.get_event_loop()
@@ -240,7 +250,7 @@ async def main() -> int:
         try:
             server = await make_server(
                 rule,
-                inactivity_timeout,
+                general,
             )
         except OSError as err:
             LOG.error("Unable to run tcp proxy at local port %s", rule.port)
@@ -269,7 +279,7 @@ async def main() -> int:
 
 def make_server(
     rule: Rule,
-    inactivity_timeout: float,
+    general: General,
 ) -> Coroutine:
     """Return a server that needs to be awaited."""
 
@@ -277,7 +287,7 @@ def make_server(
     proxy_partial = partial(
         proxy,
         rule=rule,
-        inactivity_timeout=inactivity_timeout,
+        general=general,
     )
     return asyncio.start_server(proxy_partial, address.host, address.port)
 
@@ -286,7 +296,7 @@ async def proxy(
     downstream_reader: asyncio.StreamReader,
     downstream_writer: asyncio.StreamWriter,
     rule: Rule,
-    inactivity_timeout: float,
+    general: General,
 ) -> None:
     """Handle the incoming connection."""
     open_writers: tuple[asyncio.StreamWriter, ...] = (
@@ -365,7 +375,7 @@ async def proxy(
                     pipe receives some data, the timeout is 'reset' and waits more time on both
                     pipes.
                     """
-                    timeout = InactivityTimeout(inactivity_timeout)
+                    timeout = InactivityTimeout(general.inactivity_timeout)
 
                     forward_pipe = pipe(downstream_reader, upstream_writer, timeout)
                     backward_pipe = pipe(upstream_reader, downstream_writer, timeout)
