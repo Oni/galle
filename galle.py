@@ -186,28 +186,42 @@ class Rule:
                 "The 'allowed' option is empty in [%s] section: blocking ALL traffic",
                 section,
             )
+        self.allow_all_connections = False
         self.allowed_ip_networks: List[
             ipaddress.IPv4Network | ipaddress.IPv6Network
         ] = []
         self.allowed_addresses: List[Address] = []
-        for address_or_ip_network in allowed_s:
-            try:
-                self.allowed_ip_networks.append(
-                    ipaddress.ip_network(address_or_ip_network)
+        for address_or_ip_network_or_asterisk in allowed_s:
+            if address_or_ip_network_or_asterisk == "*":
+                self.allow_all_connections = True
+                LOG.warning(
+                    "The 'allowed' option in [%s] section contains an '*': allowing ALL traffic",
+                    section,
                 )
-            except ValueError:
-                self.allowed_addresses.append(Address(address_or_ip_network))
+            else:
+                try:
+                    self.allowed_ip_networks.append(
+                        ipaddress.ip_network(address_or_ip_network_or_asterisk)
+                    )
+                except ValueError:
+                    self.allowed_addresses.append(
+                        Address(address_or_ip_network_or_asterisk)
+                    )
 
     def is_source_ip_allowed(
         self,
         source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
     ) -> bool:
-        # first: check by ip (faster)
+        # first: do we allow all connections? (fastest)
+        if self.allow_all_connections:
+            return True
+
+        # second: check by ip (faster)
         for allowed_ip_network in self.allowed_ip_networks:
             if source_ip in allowed_ip_network:
                 return True
 
-        # second: check by hostname (slower)
+        # third: check by hostname (slower)
         for allowed_address in self.allowed_addresses:
             try:
                 allowed_hostname = allowed_address.host
