@@ -6,7 +6,7 @@ import asyncio
 import logging
 import signal
 import ipaddress
-from typing import List, TypeGuard, Tuple, Coroutine
+from typing import List, Set, TypeGuard, Tuple, Coroutine
 from functools import partial
 import socket
 import pathlib
@@ -24,6 +24,8 @@ from proxyprotocol.v2 import ProxyProtocolV2
 LOG = logging.getLogger(__name__)
 BUFFER_LEN = 1024
 UPSTREAM_CONNECTION_TIMEOUT = 5  # seconds
+CONTROL_CONNECTION_TIMEOUT = 5  # seconds
+BANNED_IPS: Set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
 
 
 class Mode(Enum):
@@ -77,6 +79,18 @@ class General:
                 "Invalid config file: the 'inactivity_timeout' must be higher than 0"
             )
         self.inactivity_timeout = inactivity_timeout_f
+
+        try:
+            control_port_s = config.get("general", "control_port")
+            # configparser.NoSectionError eventually raised by previous option query
+        except configparser.NoOptionError:
+            raise ValueError(
+                "Invalid config file: no 'control_port' option in [general] section"
+            )
+        try:
+            self.control_port = int(control_port_s)
+        except ValueError:
+            raise ValueError("Invalid config file: the 'control_port' must be an int")
 
 
 class Rule:
@@ -303,6 +317,31 @@ async def main() -> int:
                 pass
 
             forevers.append(forever)
+
+    # init control listener
+    if general.control_port != -1:
+        try:
+            control_listener = await make_control_listener(general.control_port)
+        except OSError as err:
+            LOG.error(
+                "Unable to run control listener at local port %s", general.control_port
+            )
+            LOG.error(err.strerror)
+        else:
+            forever = asyncio.create_task(control_listener.serve_forever())
+            LOG.info(
+                "Started serving control listener at local port %s",
+                general.control_port,
+            )
+            try:
+                loop.add_signal_handler(signal.SIGINT, forever.cancel)
+                loop.add_signal_handler(signal.SIGTERM, forever.cancel)
+            except NotImplementedError:
+                # windows
+                pass
+    else:
+        LOG.info("Skipping creation of control request listener")
+
     try:
         await asyncio.gather(*forevers)
     except asyncio.CancelledError:
@@ -358,7 +397,10 @@ async def proxy(
     else:
         if is_valid_ip_port(pp_result.source):
             source_ip, _ = pp_result.source
-            if rule.is_source_ip_allowed(source_ip):
+            if is_source_ip_blacklisted(source_ip):
+                LOG.info("[%s] Real ip banned: %s", log_id, source_ip)
+                target_upstream = None  # always drop banned ips
+            elif rule.is_source_ip_allowed(source_ip):
                 LOG.info("[%s] Real ip allowed: %s", log_id, source_ip)
                 target_upstream = rule.upstream
             else:
@@ -445,6 +487,12 @@ def is_valid_ip_port(
     return isinstance(source, tuple)
 
 
+def is_source_ip_blacklisted(
+    source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    return source_ip in BANNED_IPS
+
+
 def pretty_hostname(address: Address) -> str:
     str_address = str(address)
     if __debug__:
@@ -512,6 +560,189 @@ def decode_data_for_logging(data: bytes) -> str:
         return decoded
     else:
         return "<some data>"
+
+
+class HeaderBeforeContentLength:
+    """
+    A state machine for simple HTTP parsing.
+
+    HeaderBeforeContentLength step: the beginning of our parsing. We are reading the HTTP header
+    waiting for the 'Content-Length: <something>\n' line.
+    """
+
+    def __init__(self):
+        self.data = b""
+
+    def consume(
+        self, data: bytes
+    ) -> HeaderBeforeContentLength | HeaderAfterContentLength | Body | CompletedBody:
+        """
+        Look for the 'Content-Length: <something>\n' line and discard everything else.
+        """
+
+        self.data += data
+
+        while True:
+            try:
+                parsable_data, self.data = self.data.split(b"\r\n", 1)
+            except ValueError:
+                return self
+
+            if parsable_data.startswith(b"Content-Length:"):
+                content_length_b = (
+                    parsable_data.replace(b"Content-Length:", b"")
+                    .replace(b"\r\n", b"")
+                    .strip()
+                )
+                try:
+                    content_length = int(content_length_b)
+                except ValueError:
+                    return self
+                else:
+                    next = HeaderAfterContentLength(content_length)
+                    return next.consume(self.data)
+
+
+class HeaderAfterContentLength:
+    """
+    A state machine for simple HTTP parsing.
+
+    HeaderAfterContentLength step: we are reading the HTTP header and discarding everything until
+    the body of the request is found.
+    """
+
+    def __init__(self, content_length):
+        self.data = b""
+        self.content_length = content_length
+
+    def consume(self, data: bytes) -> HeaderAfterContentLength | Body | CompletedBody:
+        """
+        Discard everything until the empty line is found.
+        """
+
+        self.data += data
+
+        while True:
+            try:
+                parsable_data, self.data = self.data.split(b"\r\n", 1)
+            except ValueError:
+                return self
+
+            if parsable_data == b"":
+                next = Body(self.content_length)
+                return next.consume(self.data)
+
+
+class Body:
+    """
+    A state machine for simple HTTP parsing.
+
+    Body step: we are reading and storing the HTTP body.
+    """
+
+    def __init__(self, content_length: int):
+        self.data = b""
+        self.content_length = content_length
+
+    def consume(self, data: bytes) -> Body | CompletedBody:
+        """
+        Store everything until all 'content_length' bytes are consumed.
+        """
+
+        self.data += data
+        if len(self.data) < self.content_length:
+            return self
+        else:
+            return CompletedBody(self.data)
+
+
+class CompletedBody:
+    """
+    A state machine for simple HTTP parsing.
+
+    CompletedBody step: we are done reading the body. The parsing is over.
+    """
+
+    def __init__(self, data: bytes):
+        decoded_data = data.decode("utf-8", errors="replace")
+        name_values = decoded_data.split("&")
+        self.vars = {}
+        for name_value in name_values:
+            try:
+                name, value = name_value.split("=")
+            except ValueError:
+                continue
+            self.vars[name] = value
+
+    def consume(self, data: bytes) -> CompletedBody:
+        """
+        We should never reach this point.
+        """
+        raise ValueError("Can't add data to a CompletedBody")
+
+
+def make_control_listener(
+    listening_port: int,
+) -> Coroutine:
+    address = Address(f"0.0.0.0:{listening_port}")
+    return asyncio.start_server(control, address.host, address.port)
+
+
+async def control(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """
+    Listen for an HTTP request for controlling galle.
+
+    See README for accepted commands.
+    """
+
+    LOG.debug("Control connection incoming")
+    status: HeaderBeforeContentLength | HeaderAfterContentLength | Body | CompletedBody = (
+        HeaderBeforeContentLength()
+    )
+    while not reader.at_eof():
+        try:
+            data = await asyncio.wait_for(
+                reader.read(BUFFER_LEN), CONTROL_CONNECTION_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            LOG.error("Control connection timed out")
+            break
+        status = status.consume(data)
+
+        if isinstance(status, CompletedBody):
+            break
+
+    if isinstance(status, CompletedBody):
+        verb = status.vars.get("verb", "")
+        if verb == "ban_set":
+            LOG.info("Control connection asked for 'ban_set'")
+            ips = status.vars.get("ips", "").split("-")
+            global BANNED_IPS
+            try:
+                ip_networks = [
+                    ipaddress.ip_network(x.replace("%2F", "/").replace("%3A", ":"))
+                    for x in ips
+                ]
+            except ValueError:
+                writer.write(b"HTTP/1.1 400 Bad Request")
+                LOG.info("Control [ban_set]: wrongly formatted ips")
+            else:
+                writer.write(b"HTTP/1.1 200 OK")
+                BANNED_IPS = set()
+                for ip_network in ip_networks:
+                    BANNED_IPS |= set(ip_network.hosts())
+
+                LOG.info(
+                    "Control [ban_set]: new 'BANNED_IPS' has %s items", len(BANNED_IPS)
+                )
+        else:
+            writer.write(b"HTTP/1.1 400 Bad Request")
+            LOG.info("Control invalid verb: '%s'", verb)
+    else:
+        writer.write(b"HTTP/1.1 408 Request Timeout")
+        LOG.info("Control timed out")
+
+    writer.close()
 
 
 if __name__ == "__main__":
