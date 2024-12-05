@@ -1,0 +1,16 @@
+{
+    "log_level": "info",
+    "inactivity_timeout": 5,
+    "control_port": 5656,
+    "rules": [
+        {
+            "port": 8081,
+            "upstream": "your_upstream:88",
+            "on_reject": "drop",
+            "mode": "pp_v1",
+            "repeat": "true",
+            "inactivity_timeout": 12,
+            "allowed": ["192.168.1.0/24", "www.foo.com"]
+        }
+    ]
+}

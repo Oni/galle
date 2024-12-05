@@ -10,9 +10,9 @@ from typing import List, Set, TypeGuard, Tuple, Coroutine
 from functools import partial
 import socket
 import pathlib
-import configparser
 from enum import Enum
 import time
+import json
 
 from proxyprotocol.server import Address
 from proxyprotocol.reader import ProxyProtocolReader
@@ -34,15 +34,11 @@ class Mode(Enum):
 
 
 class General:
-    def __init__(self, config: configparser.ConfigParser):
+    def __init__(self, config: dict):
         try:
-            log_level_s = config.get("general", "log_level")
-        except configparser.NoSectionError as err:
-            raise ValueError("Invalid config file: no [general] section") from err
-        except configparser.NoOptionError as err:
-            raise ValueError(
-                "Invalid config file: no 'log_level' option in [general] section"
-            ) from err
+            log_level_s = config["log_level"]
+        except KeyError as err:
+            raise ValueError("Invalid config file: no 'log_level' option") from err
 
         try:
             log_level = {
@@ -53,8 +49,7 @@ class General:
             }[log_level_s]
         except KeyError as err:
             raise ValueError(
-                "Invalid config file: 'log_level' option in [general] section must be 'error', "
-                "'warn', 'info' or 'debug'"
+                "Invalid config file: 'log_level' option must be 'error', 'warn', 'info' or 'debug'"
             ) from err
 
         logging.basicConfig(
@@ -62,11 +57,10 @@ class General:
         )
 
         try:
-            inactivity_timeout_s = config.get("general", "inactivity_timeout")
-            # configparser.NoSectionError eventually raised by previous option query
-        except configparser.NoOptionError as err:
+            inactivity_timeout_s = config["inactivity_timeout"]
+        except KeyError as err:
             raise ValueError(
-                "Invalid config file: no 'inactivity_timeout' option in [general] section"
+                "Invalid config file: no 'inactivity_timeout_s' option"
             ) from err
         try:
             inactivity_timeout_f = float(inactivity_timeout_s)
@@ -81,26 +75,31 @@ class General:
         self.inactivity_timeout = inactivity_timeout_f
 
         try:
-            control_port_s = config.get("general", "control_port")
-            # configparser.NoSectionError eventually raised by previous option query
-        except configparser.NoOptionError:
-            raise ValueError(
-                "Invalid config file: no 'control_port' option in [general] section"
-            )
+            control_port_s = config["control_port"]
+        except KeyError as err:
+            raise ValueError("Invalid config file: no 'control_port' option") from err
         try:
             self.control_port = int(control_port_s)
         except ValueError:
-            raise ValueError("Invalid config file: the 'control_port' must be an int")
+            raise ValueError(
+                "Invalid config file: the 'control_port' must be an int"
+            ) from err
 
 
 class Rule:
-    def __init__(self, config: configparser.ConfigParser, section: str):
+    def __init__(self, rule_config: dict):
         try:
-            self.port = int(section)
+            s_port = rule_config["port"]
+        except KeyError as err:
+            raise ValueError(
+                "Invalid config file: no 'port' option found in rule"
+            ) from err
+
+        try:
+            self.port = int(s_port)
         except ValueError as err:
             raise ValueError(
-                "Invalid config file: the section name (the port we want to listen "
-                "to) must be an int"
+                f"Invalid config file: the port must be an int ('{s_port}' found instead)"
             ) from err
 
         available_modes = {
@@ -108,33 +107,33 @@ class Rule:
             "pp_v2": Mode.PP_V2,
         }
         try:
-            mode_s = config.get(section, "mode")
-        except configparser.NoOptionError as err:
+            mode_s = rule_config["mode"]
+        except KeyError as err:
             raise ValueError(
-                f"Invalid config file: missing 'mode' option in [{section}] section"
+                f"Invalid config file: missing 'mode' option in [{s_port}] rule"
             ) from err
         try:
             self.pp_mode = available_modes[mode_s]
         except KeyError as err:
             raise ValueError(
-                f"Invalid config file: 'mode' option in [{section}] section must be one of 'pp_v1' "
-                "or 'pp_v2'"
+                f"Invalid config file: 'mode' option in [{s_port}] rule must be one of 'pp_v1' or "
+                f"'pp_v2' ('{mode_s}' found instead)"
             ) from err
 
         self.reject_upstream: Address | None
         try:
-            reject_action = config.get(section, "on_reject")
-        except configparser.NoOptionError as err:
+            reject_action = rule_config["on_reject"]
+        except KeyError as err:
             raise ValueError(
-                f"Invalid config file: missing 'on_reject' option in [{section}] section"
+                f"Invalid config file: missing 'on_reject' option in [{s_port}] rule"
             ) from err
         if reject_action.lower() == "drop":
             self.reject_upstream = None
         else:
             if not reject_action.lower().startswith("redirect:"):
                 raise ValueError(
-                    f"Invalid config file: 'on_reject' option in [{section}] section must be "
-                    "'drop' or 'redirect:<some_upstream>'"
+                    f"Invalid config file: 'on_reject' option in [{s_port}] rule must be 'drop' or "
+                    "'redirect:<some_upstream>' ('{reject_action}' found instead)"
                 )
             else:
                 reject_upstream_s = (
@@ -142,63 +141,63 @@ class Rule:
                 )
                 if not reject_upstream_s:
                     raise ValueError(
-                        f"Invalid config file: 'on_reject' option in [{section}] section has an "
-                        "empty upstream. Use 'drop' if you want to drop the rejected connections"
+                        f"Invalid config file: 'on_reject' option in [{s_port}] rule has an empty "
+                        "upstream. Use 'drop' if you want to drop the rejected connections"
                     )
                 self.reject_upstream = Address(reject_upstream_s)
 
         try:
-            repeat_s = config.get(section, "repeat")
-        except configparser.NoOptionError as err:
+            repeat_s = rule_config["repeat"]
+        except KeyError as err:
             raise ValueError(
-                f"Invalid config file: missing 'repeat' option in [{section}] section"
+                f"Invalid config file: missing 'repeat' option in [{s_port}] rule"
             ) from err
         try:
             self.repeat_pp = {"true": True, "false": False}[repeat_s.lower()]
         except KeyError as err:
             raise ValueError(
-                f"Invalid config file: 'repeat' option in [{section}] section must be 'true' or "
-                "'false'"
+                f"Invalid config file: 'repeat' option in [{s_port}] rule must be 'true' or "
+                "'false' ('{repeat_s}' found instead)"
             ) from err
 
         self.inactivity_timeout: float | None
         try:
-            inactivity_timeout_s = config.get(section, "inactivity_timeout")
-        except configparser.NoOptionError as err:
+            inactivity_timeout_s = rule_config["inactivity_timeout"]
+        except KeyError as err:
             self.inactivity_timeout = None
         else:
             try:
                 inactivity_timeout_f = float(inactivity_timeout_s)
             except ValueError as err:
                 raise ValueError(
-                    f"Invalid config file: the 'inactivity_timeout' in [{section}] section must be "
-                    "an int or a float"
+                    f"Invalid config file: the 'inactivity_timeout' in [{s_port}] rule must be an "
+                    "int or a float ('{inactivity_timeout_s}' found instead)"
                 ) from err
             if inactivity_timeout_f <= 0.0:
                 raise ValueError(
-                    f"Invalid config file: the 'inactivity_timeout' in [{section}] sectionmust be "
-                    "higher than 0"
+                    f"Invalid config file: the 'inactivity_timeout' in [{s_port}] rule must be "
+                    "higher than 0 ('{inactivity_timeout_s}' found instead)"
                 )
             self.inactivity_timeout = inactivity_timeout_f
 
         try:
-            self.upstream = Address(config.get(section, "upstream"))
-        except configparser.NoOptionError as err:
+            self.upstream = Address(rule_config["upstream"])
+        except KeyError as err:
             raise ValueError(
-                f"Invalid config file: missing 'upstream' option in [{section}] section"
+                f"Invalid config file: missing 'upstream' option in [{s_port}] rule"
             ) from err
 
         try:
-            allowed_ns = [x.strip() for x in config.get(section, "allowed").split(",")]
-        except configparser.NoOptionError as err:
+            allowed_ns = [x.strip() for x in rule_config["allowed"]]
+        except KeyError as err:
             raise ValueError(
-                f"Invalid config file: missing 'allowed' option in [{section}] section"
+                f"Invalid config file: missing 'allowed' option in [{s_port}] rule"
             ) from err
         allowed_s = [x for x in allowed_ns if x]
         if len(allowed_s) == 0:
             LOG.warning(
-                "The 'allowed' option is empty in [%s] section: blocking ALL traffic",
-                section,
+                "The 'allowed' option is empty in [%s] rule: blocking ALL traffic",
+                s_port,
             )
         self.allow_all_connections = False
         self.allowed_ip_networks: List[
@@ -209,8 +208,8 @@ class Rule:
             if address_or_ip_network_or_asterisk == "*":
                 self.allow_all_connections = True
                 LOG.warning(
-                    "The 'allowed' option in [%s] section contains an '*': allowing ALL traffic",
-                    section,
+                    "The 'allowed' option in [%s] rule contains an '*': allowing ALL traffic",
+                    s_port,
                 )
             else:
                 try:
@@ -270,12 +269,13 @@ async def main() -> int:
     args = parser.parse_args()
 
     config_path = args.config[0]
-    if not config_path.is_file():
-        print(f"Unable to locate {config_path}")
+    try:
+        with open(config_path, "r", encoding="utf-8") as json_data:
+            config = json.loads(json_data.read())
+            json_data.close()
+    except FileNotFoundError:
+        print(f"Unable to locate config file '{config_path}'")
         return 1
-
-    config = configparser.ConfigParser()
-    config.read(config_path)
 
     try:
         general = General(config)
@@ -284,9 +284,9 @@ async def main() -> int:
         return 1
 
     rules = []
-    for section in [x for x in config.sections() if x != "general"]:
+    for rule in config.get("rules", []):
         try:
-            rules.append(Rule(config, section))
+            rules.append(Rule(rule))
         except ValueError as err:
             print(err.args[0])
             return 1
