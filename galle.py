@@ -80,7 +80,7 @@ class General:
             raise ValueError("Invalid config file: no 'control_port' option") from err
         try:
             self.control_port = int(control_port_s)
-        except ValueError:
+        except ValueError as err:
             raise ValueError(
                 "Invalid config file: the 'control_port' must be an int"
             ) from err
