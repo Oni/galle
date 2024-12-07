@@ -158,8 +158,8 @@ class Rule:
                 inactivity_timeout_f = float(inactivity_timeout_s)
             except ValueError as err:
                 raise ValueError(
-                    f"Invalid config file: the 'inactivity_timeout' in [{self.name}] rule must be an "
-                    "int or a float ('{inactivity_timeout_s}' found instead)"
+                    f"Invalid config file: the 'inactivity_timeout' in [{self.name}] rule must be "
+                    "an int or a float ('{inactivity_timeout_s}' found instead)"
                 ) from err
             if inactivity_timeout_f <= 0.0:
                 raise ValueError(
