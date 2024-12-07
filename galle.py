@@ -29,8 +29,9 @@ BANNED_IPS: Set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
 
 
 class Mode(Enum):
-    PP_V1 = 1
-    PP_V2 = 2
+    NONE = 1
+    PP_V1 = 2
+    PP_V2 = 3
 
 
 class General:
@@ -89,20 +90,28 @@ class General:
 class Rule:
     def __init__(self, rule_config: dict):
         try:
-            s_port = rule_config["port"]
+            port_s = rule_config["port"]
         except KeyError as err:
             raise ValueError(
                 "Invalid config file: no 'port' option found in rule"
             ) from err
 
         try:
-            self.port = int(s_port)
+            self.port = int(port_s)
         except ValueError as err:
             raise ValueError(
-                f"Invalid config file: the port must be an int ('{s_port}' found instead)"
+                f"Invalid config file: the port must be an int ('{port_s}' found instead)"
+            ) from err
+
+        try:
+            self.name = rule_config["name"]
+        except KeyError as err:
+            raise ValueError(
+                "Invalid config file: no 'name' option found in rule"
             ) from err
 
         available_modes = {
+            "none": Mode.NONE,
             "pp_v1": Mode.PP_V1,
             "pp_v2": Mode.PP_V2,
         }
@@ -110,55 +119,34 @@ class Rule:
             mode_s = rule_config["mode"]
         except KeyError as err:
             raise ValueError(
-                f"Invalid config file: missing 'mode' option in [{s_port}] rule"
+                f"Invalid config file: missing 'mode' option in [{self.name}] rule"
             ) from err
         try:
             self.pp_mode = available_modes[mode_s]
         except KeyError as err:
             raise ValueError(
-                f"Invalid config file: 'mode' option in [{s_port}] rule must be one of 'pp_v1' or "
-                f"'pp_v2' ('{mode_s}' found instead)"
+                f"Invalid config file: 'mode' option in [{self.name}] rule must be one of 'none', "
+                f"'pp_v1' or 'pp_v2' ('{mode_s}' found instead)"
             ) from err
-
-        self.reject_upstream: Address | None
-        try:
-            reject_action = rule_config["on_reject"]
-        except KeyError as err:
-            raise ValueError(
-                f"Invalid config file: missing 'on_reject' option in [{s_port}] rule"
-            ) from err
-        if reject_action.lower() == "drop":
-            self.reject_upstream = None
-        else:
-            if not reject_action.lower().startswith("redirect:"):
-                raise ValueError(
-                    f"Invalid config file: 'on_reject' option in [{s_port}] rule must be 'drop' or "
-                    "'redirect:<some_upstream>' ('{reject_action}' found instead)"
-                )
-            else:
-                reject_upstream_s = (
-                    reject_action.lower().replace("redirect:", "", 1).strip()
-                )
-                if not reject_upstream_s:
-                    raise ValueError(
-                        f"Invalid config file: 'on_reject' option in [{s_port}] rule has an empty "
-                        "upstream. Use 'drop' if you want to drop the rejected connections"
-                    )
-                self.reject_upstream = Address(reject_upstream_s)
 
         try:
             repeat_s = rule_config["repeat"]
         except KeyError as err:
             raise ValueError(
-                f"Invalid config file: missing 'repeat' option in [{s_port}] rule"
+                f"Invalid config file: missing 'repeat' option in [{self.name}] rule"
             ) from err
         try:
             self.repeat_pp = {"true": True, "false": False}[repeat_s.lower()]
         except KeyError as err:
             raise ValueError(
-                f"Invalid config file: 'repeat' option in [{s_port}] rule must be 'true' or "
+                f"Invalid config file: 'repeat' option in [{self.name}] rule must be 'true' or "
                 "'false' ('{repeat_s}' found instead)"
             ) from err
+        if self.pp_mode == Mode.NONE and self.repeat_pp:
+            raise ValueError(
+                "Invalid config file: 'repeat' is set to 'true' but mode is 'none' in "
+                f"[{self.name}] rule"
+            )
 
         self.inactivity_timeout: float | None
         try:
@@ -170,34 +158,41 @@ class Rule:
                 inactivity_timeout_f = float(inactivity_timeout_s)
             except ValueError as err:
                 raise ValueError(
-                    f"Invalid config file: the 'inactivity_timeout' in [{s_port}] rule must be an "
+                    f"Invalid config file: the 'inactivity_timeout' in [{self.name}] rule must be an "
                     "int or a float ('{inactivity_timeout_s}' found instead)"
                 ) from err
             if inactivity_timeout_f <= 0.0:
                 raise ValueError(
-                    f"Invalid config file: the 'inactivity_timeout' in [{s_port}] rule must be "
+                    f"Invalid config file: the 'inactivity_timeout' in [{self.name}] rule must be "
                     "higher than 0 ('{inactivity_timeout_s}' found instead)"
                 )
             self.inactivity_timeout = inactivity_timeout_f
 
+        self.filters: List[Filter] = []
+        for filter in rule_config.get("filters", []):
+            self.filters.append(Filter(self.name, filter))
+
+
+class Filter:
+    def __init__(self, name: str, filter_config: dict):
         try:
-            self.upstream = Address(rule_config["upstream"])
+            self.upstream = Address(filter_config["upstream"])
         except KeyError as err:
             raise ValueError(
-                f"Invalid config file: missing 'upstream' option in [{s_port}] rule"
+                f"Invalid config file: missing 'upstream' option in [{name}] rule"
             ) from err
 
         try:
-            allowed_ns = [x.strip() for x in rule_config["allowed"]]
+            allowed_ns = [x.strip() for x in filter_config["allowed"]]
         except KeyError as err:
             raise ValueError(
-                f"Invalid config file: missing 'allowed' option in [{s_port}] rule"
+                f"Invalid config file: missing 'allowed' option in [{name}] rule"
             ) from err
         allowed_s = [x for x in allowed_ns if x]
         if len(allowed_s) == 0:
             LOG.warning(
                 "The 'allowed' option is empty in [%s] rule: blocking ALL traffic",
-                s_port,
+                name,
             )
         self.allow_all_connections = False
         self.allowed_ip_networks: List[
@@ -209,7 +204,7 @@ class Rule:
                 self.allow_all_connections = True
                 LOG.warning(
                     "The 'allowed' option in [%s] rule contains an '*': allowing ALL traffic",
-                    s_port,
+                    name,
                 )
             else:
                 try:
@@ -255,7 +250,9 @@ class Rule:
 
 
 async def main() -> int:
-    """The main function: gather() all servers listed in config."""
+    """
+    The main function: gather() all servers listed in config.
+    """
     parser = ArgumentParser(
         description=__doc__, formatter_class=ArgumentDefaultsHelpFormatter
     )
@@ -305,9 +302,9 @@ async def main() -> int:
         else:
             forever = asyncio.create_task(server.serve_forever())
             LOG.info(
-                "Started serving tcp proxy at local port %s that will forward traffic to %s",
+                "Started serving tcp proxy at local port %s for rule named '%s'",
                 rule.port,
-                pretty_hostname(rule.upstream),
+                rule.name,
             )
             try:
                 loop.add_signal_handler(signal.SIGINT, forever.cancel)
@@ -353,7 +350,9 @@ def make_server(
     rule: Rule,
     general: General,
 ) -> Coroutine:
-    """Return a server that needs to be awaited."""
+    """
+    Return a server that needs to be awaited.
+    """
 
     address = Address(f"0.0.0.0:{rule.port}")
     proxy_partial = partial(
@@ -370,96 +369,103 @@ async def proxy(
     rule: Rule,
     general: General,
 ) -> None:
-    """Handle the incoming connection."""
+    """
+    Handle the incoming connection.
+    """
     open_writers: tuple[asyncio.StreamWriter, ...] = (
         downstream_writer,
     )  # used to close them later
 
-    downstream_ip = downstream_writer.get_extra_info("peername")
+    downstream_ip_s, downstream_port = downstream_writer.get_extra_info("peername")
     uuid = id(downstream_writer)
-    log_id = f"{uuid}|{rule.port}|{pretty_hostname(rule.upstream)}"
-    LOG.debug("[%s] Incoming connection from %s:%s", log_id, *downstream_ip)
+    log_id = f"{uuid}|{rule.name}|{rule.port}"
+    LOG.debug(
+        "[%s] Incoming connection from %s:%s", log_id, downstream_ip_s, downstream_port
+    )
 
-    pp: ProxyProtocol = {
-        Mode.PP_V1: ProxyProtocolV1,
-        Mode.PP_V2: ProxyProtocolV2,
-    }[rule.pp_mode]()
-
-    header_reader = ProxyProtocolReader(pp)
-    try:
-        pp_result = await header_reader.read(downstream_reader)
-    except Exception as err:
-        LOG.info(
-            "[%s] Invalid PROXY protocol header",
-            log_id,
-        )
-        LOG.info(err)
+    source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None = None
+    if rule.pp_mode in (Mode.PP_V1, Mode.PP_V2):
+        pp: ProxyProtocol = {
+            Mode.PP_V1: ProxyProtocolV1,
+            Mode.PP_V2: ProxyProtocolV2,
+        }[rule.pp_mode]()
+        header_reader = ProxyProtocolReader(pp)
+        try:
+            pp_result = await header_reader.read(downstream_reader)
+        except Exception as err:
+            LOG.info(
+                "[%s] Invalid PROXY protocol header",
+                log_id,
+            )
+            LOG.info(err)
+        else:
+            if is_valid_ip_port(pp_result.source):
+                source_ip, _ = pp_result.source
     else:
-        if is_valid_ip_port(pp_result.source):
-            source_ip, _ = pp_result.source
-            if is_source_ip_blacklisted(source_ip):
-                LOG.info("[%s] Real ip banned: %s", log_id, source_ip)
-                target_upstream = None  # always drop banned ips
-            elif rule.is_source_ip_allowed(source_ip):
-                LOG.info("[%s] Real ip allowed: %s", log_id, source_ip)
-                target_upstream = rule.upstream
-            else:
-                if rule.reject_upstream is None:
-                    LOG.info("[%s] Real ip forbidden (drop): %s", log_id, source_ip)
-                    target_upstream = None
-                else:
+        source_ip = ipaddress.ip_address(downstream_ip_s)
+
+    if source_ip is not None:
+        if is_source_ip_blacklisted(source_ip):
+            LOG.info("[%s] Real ip banned: %s", log_id, source_ip)
+            target_upstream = None
+        else:
+            for filter in rule.filters:
+                if filter.is_source_ip_allowed(source_ip):
+                    target_upstream = filter.upstream
                     LOG.info(
-                        "[%s] Real ip forbidden (redirect to %s): %s",
+                        "[%s] Real ip allowed towards '%s': %s",
                         log_id,
-                        pretty_hostname(rule.reject_upstream),
+                        target_upstream,
                         source_ip,
                     )
-                    target_upstream = rule.reject_upstream
+                    break
+            else:
+                # break never reached
+                LOG.info("[%s] Real ip forbidden: %s", log_id, source_ip)
+                target_upstream = None
 
-            if target_upstream is not None:
-                try:
-                    upstream_reader, upstream_writer = await asyncio.wait_for(
-                        asyncio.open_connection(
-                            target_upstream.host, target_upstream.port
-                        ),
-                        UPSTREAM_CONNECTION_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    LOG.error("Failed to connect upstream: timed out")
-                except ConnectionRefusedError as err:
-                    LOG.error("Failed to connect upstream: connection refused")
-                    LOG.error(err.strerror)
-                except socket.gaierror as err:
-                    LOG.error(
-                        "Failed to connect upstream: unable to reach hostname %s",
-                        rule.upstream.host,
-                    )
-                    LOG.error(err.strerror)
-                except OSError as err:
-                    LOG.error(
-                        "Failed to connect upstream: probably trying to connect to an https server"
-                    )
-                    LOG.error(err.strerror)
-                else:
-                    open_writers += (upstream_writer,)
-                    if rule.repeat_pp:
-                        upstream_writer.write(pp.pack(pp_result))
-                        await upstream_writer.drain()
+        if target_upstream is not None:
+            try:
+                upstream_reader, upstream_writer = await asyncio.wait_for(
+                    asyncio.open_connection(target_upstream.host, target_upstream.port),
+                    UPSTREAM_CONNECTION_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                LOG.error("Failed to connect upstream: timed out")
+            except ConnectionRefusedError as err:
+                LOG.error("Failed to connect upstream: connection refused")
+                LOG.error(err.strerror)
+            except socket.gaierror as err:
+                LOG.error(
+                    "Failed to connect upstream: unable to reach hostname %s",
+                    filter.upstream.host,
+                )
+                LOG.error(err.strerror)
+            except OSError as err:
+                LOG.error(
+                    "Failed to connect upstream: probably trying to connect to an https server"
+                )
+                LOG.error(err.strerror)
+            else:
+                open_writers += (upstream_writer,)
+                if rule.repeat_pp:
+                    upstream_writer.write(pp.pack(pp_result))
+                    await upstream_writer.drain()
 
-                    inactivity_timeout = general.inactivity_timeout
-                    if rule.inactivity_timeout is not None:
-                        inactivity_timeout = rule.inactivity_timeout
-                    """The idea here is to have a shared timeout among the pipes. Every time any
-                    pipe receives some data, the timeout is 'reset' and waits more time on both
-                    pipes.
-                    """
-                    timeout = InactivityTimeout(inactivity_timeout)
+                inactivity_timeout = general.inactivity_timeout
+                if rule.inactivity_timeout is not None:
+                    inactivity_timeout = rule.inactivity_timeout
+                """
+                The idea here is to have a shared timeout among the pipes. Every time any pipe
+                receives some data, the timeout is 'reset' and waits more time on both pipes.
+                """
+                timeout = InactivityTimeout(inactivity_timeout)
 
-                    forward_pipe = pipe(downstream_reader, upstream_writer, timeout)
-                    backward_pipe = pipe(upstream_reader, downstream_writer, timeout)
-                    await asyncio.gather(backward_pipe, forward_pipe)
+                forward_pipe = pipe(downstream_reader, upstream_writer, timeout)
+                backward_pipe = pipe(upstream_reader, downstream_writer, timeout)
+                await asyncio.gather(backward_pipe, forward_pipe)
 
-                    await asyncio.sleep(0.1)  # wait for writes to actually drain
+                await asyncio.sleep(0.1)  # wait for writes to actually drain
 
     for writer in open_writers:
         if writer.can_write_eof():
@@ -474,7 +480,9 @@ async def proxy(
         except (ConnectionAbortedError, BrokenPipeError):
             pass
 
-    LOG.debug("[%s] Closed connection from %s:%s", log_id, *downstream_ip)
+    LOG.debug(
+        "[%s] Closed connection from %s:%s", log_id, downstream_ip_s, downstream_port
+    )
 
 
 def is_valid_ip_port(
@@ -483,7 +491,9 @@ def is_valid_ip_port(
     | tuple[ipaddress.IPv6Address, int]
     | None
 ) -> TypeGuard[Tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]]:
-    """Provide a TypeGuard for ProxyProtocolReader.read() result."""
+    """
+    Provide a TypeGuard for ProxyProtocolReader.read() result.
+    """
     return isinstance(source, tuple)
 
 
@@ -546,7 +556,8 @@ class InactivityTimeout:
 
 
 def decode_data_for_logging(data: bytes) -> str:
-    """If log level is DEBUG, decode the data (if possible) and shorten it in order to make log
+    """
+    If log level is DEBUG, decode the data (if possible) and shorten it in order to make log
     readable. For performance, if the log level is lower, just provide a placeholder text.
     """
 

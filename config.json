@@ -5,12 +5,24 @@
     "rules": [
         {
             "port": 8081,
-            "upstream": "your_upstream:88",
-            "on_reject": "drop",
+            "name": "nginx",
             "mode": "pp_v1",
             "repeat": "true",
             "inactivity_timeout": 12,
-            "allowed": ["192.168.1.0/24", "www.foo.com"]
+            "filters": [
+                {
+                    "upstream": "nginx_upstream:8080",
+                    "allowed": ["192.168.1.0/24", "www.foo.com"]
+                },
+                {
+                    "upstream": "another_upstream:2323",
+                    "allowed": ["127.0.0.1"]
+                },
+                {
+                    "upstream": "nginx_upstream:80",
+                    "allowed": ["*"]
+                }
+            ]
         }
     ]
 }
