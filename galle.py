@@ -415,7 +415,7 @@ async def proxy(
                     LOG.info(
                         "[%s] Real ip allowed towards '%s': %s",
                         log_id,
-                        target_upstream,
+                        pretty_hostname(target_upstream),
                         source_ip,
                     )
                     break
