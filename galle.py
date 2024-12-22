@@ -109,7 +109,7 @@ class General:
 
 
 class Rule:
-    def __init__(self, rule_config: dict):
+    def __init__(self, general: General, rule_config: dict):
         try:
             port_s = rule_config["port"]
         except KeyError as err:
@@ -194,11 +194,12 @@ class Rule:
                 f"[{self.name}] rule"
             )
 
-        self.inactivity_timeout: float | None
+        self.inactivity_timeout: float
         try:
             inactivity_timeout_s = rule_config["inactivity_timeout"]
         except KeyError as err:
-            self.inactivity_timeout = None
+            # use general default inactivity_timeout
+            self.inactivity_timeout = general.inactivity_timeout
         else:
             try:
                 inactivity_timeout_f = float(inactivity_timeout_s)
@@ -354,7 +355,7 @@ async def main() -> int:
     rules = []
     for rule in config.get("rules", []):
         try:
-            rules.append(Rule(rule))
+            rules.append(Rule(general, rule))
         except ValueError as err:
             print(err.args[0])
             return 1
@@ -642,7 +643,9 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
             # 100% sure that downstream_transport is not None
             downstream_transport.sendto(data, self.addr)
         self.timeout_handler = self.loop.call_later(
-            self.downstream_protocol.rule.inactivity_timeout, close_upstream_transport, self
+            self.downstream_protocol.rule.inactivity_timeout,
+            close_upstream_transport,
+            self,
         )
 
     def error_received(self, err) -> None:
