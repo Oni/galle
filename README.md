@@ -1,16 +1,16 @@
 # Galle
 
-A simple tcp proxy that filters incoming connections based on request source.
+A simple tcp/udp proxy that filters incoming connections based on request source.
 
-The proxy is written in python.
+This proxy is written in pure python.
 
-It supports generic tcp filtering using "PROXY protocol" to get information on the real source of the connection.
+Tcp filtering supports "PROXY protocol" to get information on the real source of the connection. Udp proxy doesn't support any derivate of "PROXY protocol" for now.
 
-The general idea is that this proxy will listen to a user defined list of ports and will forward only whitelisted ips/hostnames to upstream. Each port is "mapped" to a specific upstream.
+The general idea is that this proxy will listen to a user defined list of ports and will forward only whitelisted ips/hostnames to upstream. Each "whitelist" is mapped to a specific upstream.
 
-Rejected connections can be simply dropped or redirected to a different upstream.
+Rejected connections are dropped.
 
-Galle also holds a list ok blacklisted ips. All connections coming from blacklisted ips are *always* dropped and *never* follow redirect rules.
+Galle also holds a list of blacklisted ips. All connections coming from blacklisted ips are *always* dropped and *never* follow redirect rules.
 
 ## Remote control
 
@@ -26,6 +26,6 @@ This will reset the list of banned ips and will be set to the new 'ips' list. Th
 
 ## Usage
 
-    python galle.py <path to ini config file>
+    python galle.py <path to json config file>
 
 A sample config file and Dockerfile is provided.

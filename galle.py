@@ -28,10 +28,31 @@ CONTROL_CONNECTION_TIMEOUT = 5  # seconds
 BANNED_IPS: Set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
 
 
-class Mode(Enum):
+class ProxyProtocolMode(Enum):
     NONE = 1
     PP_V1 = 2
     PP_V2 = 3
+
+
+class ConnectionMode(Enum):
+    TCP = 1
+    UDP = 2
+
+
+class AddressWithPort(Address):
+    def __init__(self, address: str):
+        super().__init__(address)
+
+        if self.port is None:
+            raise ValueError(f"Invalid address '{address}': port is missing")
+
+    @property
+    def port(self) -> int:
+        port = super().port
+        if port is None:
+            raise ValueError("It's impossible to be here")
+        else:
+            return port
 
 
 class General:
@@ -111,9 +132,8 @@ class Rule:
             ) from err
 
         available_modes = {
-            "none": Mode.NONE,
-            "pp_v1": Mode.PP_V1,
-            "pp_v2": Mode.PP_V2,
+            "tcp": ConnectionMode.TCP,
+            "udp": ConnectionMode.UDP,
         }
         try:
             mode_s = rule_config["mode"]
@@ -122,27 +142,53 @@ class Rule:
                 f"Invalid config file: missing 'mode' option in [{self.name}] rule"
             ) from err
         try:
-            self.pp_mode = available_modes[mode_s]
+            self.mode = available_modes[mode_s.lower()]
         except KeyError as err:
             raise ValueError(
-                f"Invalid config file: 'mode' option in [{self.name}] rule must be one of 'none', "
-                f"'pp_v1' or 'pp_v2' ('{mode_s}' found instead)"
+                f"Invalid config file: 'mode' option in [{self.name}] rule must be one of 'tcp', "
+                f"or 'udp' ('{mode_s}' found instead)"
             ) from err
 
+        available_proxy_protocols = {
+            "none": ProxyProtocolMode.NONE,
+            "pp_v1": ProxyProtocolMode.PP_V1,
+            "pp_v2": ProxyProtocolMode.PP_V2,
+        }
         try:
-            repeat_s = rule_config["repeat"]
+            proxy_protocol_s = rule_config["proxy_protocol"]
         except KeyError as err:
             raise ValueError(
-                f"Invalid config file: missing 'repeat' option in [{self.name}] rule"
+                f"Invalid config file: missing 'proxy_protocol' option in [{self.name}] rule"
             ) from err
         try:
-            self.repeat_pp = {"true": True, "false": False}[repeat_s.lower()]
+            self.pp_mode = available_proxy_protocols[proxy_protocol_s]
         except KeyError as err:
             raise ValueError(
-                f"Invalid config file: 'repeat' option in [{self.name}] rule must be 'true' or "
-                "'false' ('{repeat_s}' found instead)"
+                f"Invalid config file: 'proxy_protocol' option in [{self.name}] rule must be one "
+                f"of 'none', 'pp_v1' or 'pp_v2' ('{proxy_protocol_s}' found instead)"
             ) from err
-        if self.pp_mode == Mode.NONE and self.repeat_pp:
+        if self.mode == ConnectionMode.UDP and self.pp_mode != ProxyProtocolMode.NONE:
+            raise ValueError(
+                f"Invalid config file: 'proxy_protocol' '{proxy_protocol_s}' works only in tcp "
+                f"mode in [{self.name}] rule"
+            )
+
+        try:
+            repeat_proxy_protocol_s = rule_config["repeat_proxy_protocol"]
+        except KeyError as err:
+            raise ValueError(
+                f"Invalid config file: missing 'repeat_proxy_protocol' option in [{self.name}] rule"
+            ) from err
+        try:
+            self.repeat_pp = {"true": True, "false": False}[
+                repeat_proxy_protocol_s.lower()
+            ]
+        except KeyError as err:
+            raise ValueError(
+                f"Invalid config file: 'repeat_proxy_protocol' option in [{self.name}] rule must "
+                "be 'true' or 'false' ('{repeat_proxy_protocol_s}' found instead)"
+            ) from err
+        if self.pp_mode == ProxyProtocolMode.NONE and self.repeat_pp:
             raise ValueError(
                 "Invalid config file: 'repeat' is set to 'true' but mode is 'none' in "
                 f"[{self.name}] rule"
@@ -172,14 +218,39 @@ class Rule:
         for filter in rule_config.get("filters", []):
             self.filters.append(Filter(self.name, filter))
 
+    def pick_upstream_and_log(
+        self, source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address, log_id: str
+    ) -> Filter | None:
+        if is_source_ip_blacklisted(source_ip):
+            LOG.info("[%s] Real ip banned: %s", log_id, source_ip)
+            return None
+        else:
+            for filter in self.filters:
+                if filter.is_source_ip_allowed(source_ip):
+                    LOG.info(
+                        "[%s] Real ip allowed towards '%s': %s",
+                        log_id,
+                        pretty_hostname(filter.upstream),
+                        source_ip,
+                    )
+                    return filter
+
+            # no filter allowed the source ip
+            LOG.info("[%s] Real ip forbidden: %s", log_id, source_ip)
+            return None
+
 
 class Filter:
     def __init__(self, name: str, filter_config: dict):
         try:
-            self.upstream = Address(filter_config["upstream"])
+            self.upstream = AddressWithPort(filter_config["upstream"])
         except KeyError as err:
             raise ValueError(
                 f"Invalid config file: missing 'upstream' option in [{name}] rule"
+            ) from err
+        except ValueError as err:
+            raise ValueError(
+                f"Invalid config file: 'upstream' is missing the port in [{name}] rule"
             ) from err
 
         try:
@@ -291,29 +362,47 @@ async def main() -> int:
     loop = asyncio.get_event_loop()
     forevers = []
     for rule in rules:
-        try:
-            server = await make_server(
-                rule,
-                general,
-            )
-        except OSError as err:
-            LOG.error("Unable to run tcp proxy at local port %s", rule.port)
-            LOG.error(err.strerror)
-        else:
-            forever = asyncio.create_task(server.serve_forever())
-            LOG.info(
-                "Started serving tcp proxy at local port %s for rule named '%s'",
-                rule.port,
-                rule.name,
-            )
+        if rule.mode == ConnectionMode.TCP:
             try:
-                loop.add_signal_handler(signal.SIGINT, forever.cancel)
-                loop.add_signal_handler(signal.SIGTERM, forever.cancel)
-            except NotImplementedError:
-                # windows
-                pass
+                server = await make_TCP_server(
+                    rule,
+                    general,
+                )
+            except OSError as err:
+                LOG.error("Unable to run tcp proxy at local port %s", rule.port)
+                LOG.error(err.strerror)
+            else:
+                forever = asyncio.create_task(server.serve_forever())
+                LOG.info(
+                    "Started serving tcp proxy at local port %s for rule named '%s'",
+                    rule.port,
+                    rule.name,
+                )
+                try:
+                    loop.add_signal_handler(signal.SIGINT, forever.cancel)
+                    loop.add_signal_handler(signal.SIGTERM, forever.cancel)
+                except NotImplementedError:
+                    # windows
+                    pass
 
-            forevers.append(forever)
+                forevers.append(forever)
+
+        else:  # rule.mode = ConnectionMode.UDP
+            try:
+                await make_UDP_server(
+                    loop,
+                    rule,
+                    general,
+                )
+            except OSError as err:
+                LOG.error("Unable to run udp proxy at local port %s", rule.port)
+                LOG.error(err.strerror)
+            else:
+                LOG.info(
+                    "Started serving udp proxy at local port %s for rule named '%s'",
+                    rule.port,
+                    rule.name,
+                )
 
     # init control listener
     if general.control_port != -1:
@@ -346,7 +435,7 @@ async def main() -> int:
     return 0
 
 
-def make_server(
+def make_TCP_server(
     rule: Rule,
     general: General,
 ) -> Coroutine:
@@ -384,10 +473,10 @@ async def proxy(
     )
 
     source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None = None
-    if rule.pp_mode in (Mode.PP_V1, Mode.PP_V2):
+    if rule.pp_mode in (ProxyProtocolMode.PP_V1, ProxyProtocolMode.PP_V2):
         pp: ProxyProtocol = {
-            Mode.PP_V1: ProxyProtocolV1,
-            Mode.PP_V2: ProxyProtocolV2,
+            ProxyProtocolMode.PP_V1: ProxyProtocolV1,
+            ProxyProtocolMode.PP_V2: ProxyProtocolV2,
         }[rule.pp_mode]()
         header_reader = ProxyProtocolReader(pp)
         try:
@@ -405,29 +494,12 @@ async def proxy(
         source_ip = ipaddress.ip_address(downstream_ip_s)
 
     if source_ip is not None:
-        if is_source_ip_blacklisted(source_ip):
-            LOG.info("[%s] Real ip banned: %s", log_id, source_ip)
-            target_upstream = None
-        else:
-            for filter in rule.filters:
-                if filter.is_source_ip_allowed(source_ip):
-                    target_upstream = filter.upstream
-                    LOG.info(
-                        "[%s] Real ip allowed towards '%s': %s",
-                        log_id,
-                        pretty_hostname(target_upstream),
-                        source_ip,
-                    )
-                    break
-            else:
-                # break never reached
-                LOG.info("[%s] Real ip forbidden: %s", log_id, source_ip)
-                target_upstream = None
+        filter = rule.pick_upstream_and_log(source_ip, log_id)
 
-        if target_upstream is not None:
+        if filter is not None:
             try:
                 upstream_reader, upstream_writer = await asyncio.wait_for(
-                    asyncio.open_connection(target_upstream.host, target_upstream.port),
+                    asyncio.open_connection(filter.upstream.host, filter.upstream.port),
                     UPSTREAM_CONNECTION_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -485,6 +557,119 @@ async def proxy(
     )
 
 
+def make_UDP_server(
+    loop: asyncio.AbstractEventLoop,
+    rule: Rule,
+    general: General,
+) -> Coroutine:
+    """
+    Return a server that needs to be awaited.
+    """
+
+    return loop.create_datagram_endpoint(
+        lambda: DownstreamProtocol(loop, rule, general),
+        local_addr=("0.0.0.0", rule.port),
+    )
+
+
+class DownstreamProtocol(asyncio.DatagramProtocol):
+    def __init__(self, loop: asyncio.AbstractEventLoop, rule: Rule, general: General):
+        self.loop = loop
+        self.rule = rule
+        self.general = general
+
+        self.downstream_transport: asyncio.DatagramTransport | None = None
+
+    def connection_made(self, downstream_transport: asyncio.DatagramTransport):  # type: ignore[override]
+        self.downstream_transport = downstream_transport
+
+    def datagram_received(self, data: bytes, addr: Tuple[str, str]):  # type: ignore[override]
+        downstream_ip, downstream_port = addr
+        uuid = "datagram"
+        self.log_id = f"{uuid}|{self.rule.name}|{self.rule.port}"
+        LOG.debug(
+            "[%s] Incoming connection from %s:%s",
+            self.log_id,
+            downstream_ip,
+            downstream_port,
+        )
+
+        source_ip = ipaddress.ip_address(downstream_ip)
+        filter = self.rule.pick_upstream_and_log(source_ip, self.log_id)
+
+        if filter is not None:
+            try:
+                self.loop.create_task(
+                    self.loop.create_datagram_endpoint(
+                        lambda: UpstreamProtocol(self.loop, self, addr, data),
+                        remote_addr=(filter.upstream.host, filter.upstream.port),
+                    )
+                )
+            except OSError as err:
+                LOG.error("Failed to connect upstream")
+                LOG.error(err.strerror)
+
+    def error_received(self, err) -> None:
+        LOG.debug("[%s] Error in datagram downstream: %s", self.log_id, err)
+
+
+class UpstreamProtocol(asyncio.DatagramProtocol):
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        downstream_protocol: DownstreamProtocol,
+        addr,
+        data,
+    ):
+        self.loop = loop
+        self.downstream_protocol = downstream_protocol
+        self.addr = addr
+        self.data = data
+
+        self.upstream_transport: asyncio.DatagramTransport | None = None
+        self.timeout_handler: asyncio.TimerHandle | None = None
+
+    def connection_made(self, upstream_transport: asyncio.DatagramTransport) -> None:  # type: ignore[override]
+        self.upstream_transport = upstream_transport
+        self.upstream_transport.sendto(self.data)
+
+    def datagram_received(self, data: bytes, addr: Tuple[str, str]) -> None:  # type: ignore[override]
+        if self.timeout_handler is not None:
+            self.timeout_handler.cancel()
+
+        downstream_transport = self.downstream_protocol.downstream_transport
+        if downstream_transport is not None:
+            # 100% sure that downstream_transport is not None
+            downstream_transport.sendto(data, self.addr)
+        self.timeout_handler = self.loop.call_later(
+            self.downstream_protocol.rule.inactivity_timeout, close_upstream_transport, self
+        )
+
+    def error_received(self, err) -> None:
+        LOG.debug(
+            "[%s] Error in datagram upstream: %s", self.downstream_protocol.log_id, err
+        )
+
+    def connection_lost(self, err) -> None:
+        LOG.debug(
+            "[%s] Upstream connection lost: %s", self.downstream_protocol.log_id, err
+        )
+
+
+def close_upstream_transport(upstream_protocol: UpstreamProtocol) -> None:
+    downstream_ip_s, downstream_port = upstream_protocol.addr
+    LOG.debug(
+        "[%s] Closed connection from %s:%s",
+        upstream_protocol.downstream_protocol.log_id,
+        downstream_ip_s,
+        downstream_port,
+    )
+    upstream_transport = upstream_protocol.upstream_transport
+    if upstream_transport is not None:
+        # 100% sure that upstream_transport is not None
+        upstream_transport.close()
+
+
 def is_valid_ip_port(
     source: str
     | tuple[ipaddress.IPv4Address, int]
@@ -533,7 +718,7 @@ class InactivityTimeout:
     This Object handles shared pipe timeout.
     """
 
-    def __init__(self, timeout):
+    def __init__(self, timeout: float):
         """
         The remaining time until timeout is prolonged every time we 'awake()' this
         InactivityTimeout.
