@@ -554,6 +554,13 @@ async def proxy(
                         ) = downstream_writer.get_extra_info("sockname")
                         destination_ip = ipaddress.ip_address(destination_ip_s)
 
+                        '''
+                        Important note: don't use 'downstream_ip' instead of 'source_ip' because, at
+                        this point, the connection is considered to be coming from 'source_ip'.
+
+                        Reminder: if there isn't a downstream proxy protocol, the 'downstream_ip'
+                        and the 'source_ip' are the same.
+                        '''
                         upstream_pp_result: ProxyResultIPv4 | ProxyResultIPv6
                         if isinstance(source_ip, ipaddress.IPv4Address) and isinstance(
                             destination_ip, ipaddress.IPv4Address
