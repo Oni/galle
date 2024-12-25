@@ -588,6 +588,7 @@ async def proxy(
                             )
 
                         upstream_writer.write(rule.upstream_pp.pack(upstream_pp_result))
+                        await upstream_writer.drain()
 
                 inactivity_timeout = general.inactivity_timeout
                 if rule.inactivity_timeout is not None:
