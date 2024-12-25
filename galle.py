@@ -163,9 +163,7 @@ class Rule:
                 f"[{self.name}] rule"
             ) from err
         try:
-            self.downstream_pp_mode = available_proxy_protocols[
-                downstream_proxy_protocol_s
-            ]
+            downstream_pp_mode = available_proxy_protocols[downstream_proxy_protocol_s]
         except KeyError as err:
             raise ValueError(
                 f"Invalid config file: 'from_downstream_proxy_protocol' option in [{self.name}] "
@@ -174,13 +172,21 @@ class Rule:
             ) from err
         if (
             self.mode == ConnectionMode.UDP
-            and self.downstream_pp_mode != ProxyProtocolMode.NONE
+            and downstream_pp_mode != ProxyProtocolMode.NONE
         ):
             raise ValueError(
                 "Invalid config file: 'from_downstream_proxy_protocol' "
                 f"'{downstream_proxy_protocol_s}' works only in tcp "
                 f"mode in [{self.name}] rule"
             )
+        self.downstream_pp: ProxyProtocol | None
+        if downstream_pp_mode in (ProxyProtocolMode.PP_V1, ProxyProtocolMode.PP_V2):
+            self.downstream_pp = {
+                ProxyProtocolMode.PP_V1: ProxyProtocolV1,
+                ProxyProtocolMode.PP_V2: ProxyProtocolV2,
+            }[downstream_pp_mode]()
+        else:
+            self.downstream_pp = None
 
         try:
             upstream_proxy_protocol_s = rule_config["to_upstream_proxy_protocol"]
@@ -190,7 +196,7 @@ class Rule:
                 f"[{self.name}] rule"
             ) from err
         try:
-            self.upstream_pp_mode = available_proxy_protocols[upstream_proxy_protocol_s]
+            upstream_pp_mode = available_proxy_protocols[upstream_proxy_protocol_s]
         except KeyError as err:
             raise ValueError(
                 f"Invalid config file: 'to_upstream_proxy_protocol' option in [{self.name}] rule "
@@ -199,14 +205,23 @@ class Rule:
             ) from err
         if (
             self.mode == ConnectionMode.UDP
-            and self.upstream_pp_mode != ProxyProtocolMode.NONE
+            and upstream_pp_mode != ProxyProtocolMode.NONE
         ):
             raise ValueError(
                 "Invalid config file: 'to_upstream_proxy_protocol' "
                 f"'{upstream_proxy_protocol_s}' works only in tcp mode in [{self.name}] rule"
             )
+        self.upstream_pp: ProxyProtocol | None
+        if upstream_pp_mode in (ProxyProtocolMode.PP_V1, ProxyProtocolMode.PP_V2):
+            self.upstream_pp = {
+                ProxyProtocolMode.PP_V1: ProxyProtocolV1,
+                ProxyProtocolMode.PP_V2: ProxyProtocolV2,
+            }[upstream_pp_mode]()
+        else:
+            self.upstream_pp = None
 
-        self.repeat_pp = self.downstream_pp_mode == self.upstream_pp_mode
+        # can be both None
+        self.repeat_pp = type(self.downstream_pp) == type(self.upstream_pp)
 
         self.inactivity_timeout: float
         try:
@@ -488,12 +503,8 @@ async def proxy(
     )
 
     source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None = None
-    if rule.downstream_pp_mode in (ProxyProtocolMode.PP_V1, ProxyProtocolMode.PP_V2):
-        downstream_pp: ProxyProtocol = {
-            ProxyProtocolMode.PP_V1: ProxyProtocolV1,
-            ProxyProtocolMode.PP_V2: ProxyProtocolV2,
-        }[rule.downstream_pp_mode]()
-        header_reader = ProxyProtocolReader(downstream_pp)
+    if rule.downstream_pp is not None:
+        header_reader = ProxyProtocolReader(rule.downstream_pp)
         try:
             downstream_pp_result = await header_reader.read(downstream_reader)
         except Exception as err:
@@ -535,19 +546,13 @@ async def proxy(
                 LOG.error(err.strerror)
             else:
                 open_writers += (upstream_writer,)
-                if rule.upstream_pp_mode in (
-                    ProxyProtocolMode.PP_V1,
-                    ProxyProtocolMode.PP_V2,
-                ):
-                    if rule.repeat_pp:
-                        upstream_writer.write(downstream_pp.pack(downstream_pp_result))
+                if rule.upstream_pp is not None:
+                    if rule.downstream_pp is not None and rule.repeat_pp:
+                        upstream_writer.write(
+                            rule.downstream_pp.pack(downstream_pp_result)
+                        )
                         await upstream_writer.drain()
                     else:
-                        upstream_pp: ProxyProtocol = {
-                            ProxyProtocolMode.PP_V1: ProxyProtocolV1,
-                            ProxyProtocolMode.PP_V2: ProxyProtocolV2,
-                        }[rule.upstream_pp_mode]()
-
                         (
                             destination_ip_s,
                             destination_port,
@@ -582,7 +587,7 @@ async def proxy(
                                 "Incompatible source and destination ip version"
                             )
 
-                        upstream_writer.write(upstream_pp.pack(upstream_pp_result))
+                        upstream_writer.write(rule.upstream_pp.pack(upstream_pp_result))
 
                 inactivity_timeout = general.inactivity_timeout
                 if rule.inactivity_timeout is not None:
