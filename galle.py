@@ -159,7 +159,7 @@ class Rule:
             downstream_proxy_protocol_s = rule_config["from_downstream_proxy_protocol"]
         except KeyError as err:
             raise ValueError(
-                "Invalid config file: missing 'from_downstream_proxy_protocol' option in " \
+                "Invalid config file: missing 'from_downstream_proxy_protocol' option in "
                 f"[{self.name}] rule"
             ) from err
         try:
@@ -168,8 +168,8 @@ class Rule:
             ]
         except KeyError as err:
             raise ValueError(
-                f"Invalid config file: 'from_downstream_proxy_protocol' option in [{self.name}] " \
-                "rule must be one of 'none', 'pp_v1' or 'pp_v2' " \
+                f"Invalid config file: 'from_downstream_proxy_protocol' option in [{self.name}] "
+                "rule must be one of 'none', 'pp_v1' or 'pp_v2' "
                 f"('{downstream_proxy_protocol_s}' found instead)"
             ) from err
         if (
@@ -177,7 +177,7 @@ class Rule:
             and self.downstream_pp_mode != ProxyProtocolMode.NONE
         ):
             raise ValueError(
-                "Invalid config file: 'from_downstream_proxy_protocol' " \
+                "Invalid config file: 'from_downstream_proxy_protocol' "
                 f"'{downstream_proxy_protocol_s}' works only in tcp "
                 f"mode in [{self.name}] rule"
             )
@@ -186,15 +186,15 @@ class Rule:
             upstream_proxy_protocol_s = rule_config["to_upstream_proxy_protocol"]
         except KeyError as err:
             raise ValueError(
-                "Invalid config file: missing 'to_upstream_proxy_protocol' option in " \
+                "Invalid config file: missing 'to_upstream_proxy_protocol' option in "
                 f"[{self.name}] rule"
             ) from err
         try:
             self.upstream_pp_mode = available_proxy_protocols[upstream_proxy_protocol_s]
         except KeyError as err:
             raise ValueError(
-                f"Invalid config file: 'to_upstream_proxy_protocol' option in [{self.name}] rule " \
-                f"must be one of 'none', 'pp_v1' or 'pp_v2' ('{upstream_proxy_protocol_s}' found " \
+                f"Invalid config file: 'to_upstream_proxy_protocol' option in [{self.name}] rule "
+                f"must be one of 'none', 'pp_v1' or 'pp_v2' ('{upstream_proxy_protocol_s}' found "
                 "instead)"
             ) from err
         if (
@@ -202,7 +202,7 @@ class Rule:
             and self.upstream_pp_mode != ProxyProtocolMode.NONE
         ):
             raise ValueError(
-                "Invalid config file: 'to_upstream_proxy_protocol' " \
+                "Invalid config file: 'to_upstream_proxy_protocol' "
                 f"'{upstream_proxy_protocol_s}' works only in tcp mode in [{self.name}] rule"
             )
 
@@ -554,13 +554,13 @@ async def proxy(
                         ) = downstream_writer.get_extra_info("sockname")
                         destination_ip = ipaddress.ip_address(destination_ip_s)
 
-                        '''
+                        """
                         Important note: don't use 'downstream_ip' instead of 'source_ip' because, at
                         this point, the connection is considered to be coming from 'source_ip'.
 
                         Reminder: if there isn't a downstream proxy protocol, the 'downstream_ip'
                         and the 'source_ip' are the same.
-                        '''
+                        """
                         upstream_pp_result: ProxyResultIPv4 | ProxyResultIPv6
                         if isinstance(source_ip, ipaddress.IPv4Address) and isinstance(
                             destination_ip, ipaddress.IPv4Address
