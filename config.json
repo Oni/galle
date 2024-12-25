@@ -7,8 +7,8 @@
             "port": 8081,
             "name": "nginx",
             "mode": "tcp",
-            "proxy_protocol": "pp_v1",
-            "repeat_proxy_protocol": "true",
+            "from_downstream_proxy_protocol": "pp_v1",
+            "to_upstream_proxy_protocol": "pp_v2",
             "inactivity_timeout": 12,
             "filters": [
                 {
@@ -29,8 +29,8 @@
             "port": 8082,
             "name": "ntp",
             "mode": "udp",
-            "proxy_protocol": "none",
-            "repeat_proxy_protocol": "false",
+            "from_downstream_proxy_protocol": "none",
+            "to_upstream_proxy_protocol": "none",
             "inactivity_timeout": 12,
             "filters": [
                 {
