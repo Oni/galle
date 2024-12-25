@@ -617,6 +617,76 @@ async def proxy(
     )
 
 
+def is_valid_ip_port(
+    source: str
+    | tuple[ipaddress.IPv4Address, int]
+    | tuple[ipaddress.IPv6Address, int]
+    | None
+) -> TypeGuard[Tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]]:
+    """
+    Provide a TypeGuard for ProxyProtocolReader.read() result.
+    """
+    return isinstance(source, tuple)
+
+
+def is_source_ip_blacklisted(
+    source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    return source_ip in BANNED_IPS
+
+
+def pretty_hostname(address: Address) -> str:
+    str_address = str(address)
+    if __debug__:
+        assert str_address.startswith("//")
+    return str_address[2:]
+
+
+async def pipe(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    timeout: InactivityTimeout,
+) -> None:
+    remaining_seconds = timeout.remaining
+    while remaining_seconds and not reader.at_eof():
+        try:
+            writer.write(
+                await asyncio.wait_for(reader.read(BUFFER_LEN), remaining_seconds)
+            )
+            timeout.awake()
+        except asyncio.TimeoutError:
+            pass
+
+        remaining_seconds = timeout.remaining
+
+
+class InactivityTimeout:
+    """
+    This Object handles shared pipe timeout.
+    """
+
+    def __init__(self, timeout: float):
+        """
+        The remaining time until timeout is prolonged every time we 'awake()' this
+        InactivityTimeout.
+
+        E.g. if we have t = InactivityTimeout(5), t.remaining should be around 5 seconds.
+        If, after 3 seconds we query t.remaining again, we should get around 2 seconds.
+        If we call t.awake() and we query t.remaining, it should be back again at around 5 seconds.
+        """
+        self.last_awake = time.time()
+        self.timeout = timeout
+
+    def awake(self) -> None:
+        self.last_awake = time.time()
+
+    @property
+    def remaining(self) -> float:  # >= 0
+        now = time.time()
+        remaining = self.last_awake + self.timeout - now
+        return max(remaining, 0)
+
+
 def make_UDP_server(
     loop: asyncio.AbstractEventLoop,
     rule: Rule,
@@ -730,76 +800,6 @@ def close_upstream_transport(upstream_protocol: UpstreamProtocol) -> None:
     if upstream_transport is not None:
         # 100% sure that upstream_transport is not None
         upstream_transport.close()
-
-
-def is_valid_ip_port(
-    source: str
-    | tuple[ipaddress.IPv4Address, int]
-    | tuple[ipaddress.IPv6Address, int]
-    | None
-) -> TypeGuard[Tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]]:
-    """
-    Provide a TypeGuard for ProxyProtocolReader.read() result.
-    """
-    return isinstance(source, tuple)
-
-
-def is_source_ip_blacklisted(
-    source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
-) -> bool:
-    return source_ip in BANNED_IPS
-
-
-def pretty_hostname(address: Address) -> str:
-    str_address = str(address)
-    if __debug__:
-        assert str_address.startswith("//")
-    return str_address[2:]
-
-
-async def pipe(
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
-    timeout: InactivityTimeout,
-) -> None:
-    remaining_seconds = timeout.remaining
-    while remaining_seconds and not reader.at_eof():
-        try:
-            writer.write(
-                await asyncio.wait_for(reader.read(BUFFER_LEN), remaining_seconds)
-            )
-            timeout.awake()
-        except asyncio.TimeoutError:
-            pass
-
-        remaining_seconds = timeout.remaining
-
-
-class InactivityTimeout:
-    """
-    This Object handles shared pipe timeout.
-    """
-
-    def __init__(self, timeout: float):
-        """
-        The remaining time until timeout is prolonged every time we 'awake()' this
-        InactivityTimeout.
-
-        E.g. if we have t = InactivityTimeout(5), t.remaining should be around 5 seconds.
-        If, after 3 seconds we query t.remaining again, we should get around 2 seconds.
-        If we call t.awake() and we query t.remaining, it should be back again at around 5 seconds.
-        """
-        self.last_awake = time.time()
-        self.timeout = timeout
-
-    def awake(self) -> None:
-        self.last_awake = time.time()
-
-    @property
-    def remaining(self) -> float:  # >= 0
-        now = time.time()
-        remaining = self.last_awake + self.timeout - now
-        return max(remaining, 0)
 
 
 def decode_data_for_logging(data: bytes) -> str:
