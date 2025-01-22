@@ -462,7 +462,7 @@ async def main() -> int:
         LOG.info("Skipping creation of control request listener")
 
     try:
-        await asyncio.gather(*forevers)
+        await asyncio.Future()
     except asyncio.CancelledError:
         pass
     return 0
