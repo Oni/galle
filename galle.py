@@ -391,7 +391,7 @@ async def main() -> int:
             return 1
 
     loop = asyncio.get_event_loop()
-    forevers = []
+    forevers: List[asyncio.Task] = []
     for rule in rules:
         if rule.mode == ConnectionMode.TCP:
             try:
