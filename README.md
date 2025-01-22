@@ -4,7 +4,7 @@ A simple tcp/udp proxy that filters incoming connections based on request source
 
 This proxy is written in pure python.
 
-Tcp filtering supports "PROXY protocol" to get information on the real source of the connection. Udp proxy doesn't support any derivate of "PROXY protocol" for now.
+Filtering supports "PROXY protocol" to get information on the real source of the connection. Udp proxy doesn't support "PROXY protocol" version 1.
 
 The general idea is that this proxy will listen to a user defined list of ports and will forward only whitelisted ips/hostnames to upstream. Each "whitelist" is mapped to a specific upstream.
 
