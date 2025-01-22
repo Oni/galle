@@ -818,7 +818,7 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
 
 class UDPProxyProtocol(asyncio.DatagramProtocol):
     """
-    This object controls connections coming from the upstream.
+    This object is the actual proxy.
     """
 
     def __init__(
