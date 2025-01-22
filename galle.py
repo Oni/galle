@@ -456,6 +456,8 @@ async def main() -> int:
             except NotImplementedError:
                 # windows
                 pass
+
+            forevers.append(forever)
     else:
         LOG.info("Skipping creation of control request listener")
 
