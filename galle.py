@@ -725,25 +725,18 @@ class DownstreamProtocol(asyncio.DatagramProtocol):
         self.rule = rule
         self.general = general
 
-        self.source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None = None
-        self.downstream_pp_result: ProxyResult | None = None
-        self.data = b""
-        self.addr = ("", "")
-
         self.downstream_transport: asyncio.DatagramTransport | None = None
 
     def connection_made(self, downstream_transport: asyncio.DatagramTransport):  # type: ignore[override]
         self.downstream_transport = downstream_transport
 
     def datagram_received(self, full_data: bytes, addr: Tuple[str, str]):  # type: ignore[override]
-        self.addr = addr
-
         downstream_ip, downstream_port = addr
         uuid = "datagram"
-        self.log_id = f"{uuid}|{self.rule.name}|{self.rule.port}"
+        log_id = f"{uuid}|{self.rule.name}|{self.rule.port}"
         LOG.debug(
             "[%s] Incoming connection from %s:%s",
-            self.log_id,
+            log_id,
             downstream_ip,
             downstream_port,
         )
@@ -752,58 +745,65 @@ class DownstreamProtocol(asyncio.DatagramProtocol):
         Catch incoming data and extract the source ip: the real one or the one embedded in the PROXY
         protocol.
         """
+        downstream_pp_result = None
         downstream_pp = self.rule.downstream_pp
-        if downstream_pp is not None:
-            if isinstance(downstream_pp, ProxyProtocolV2):
-                # make mypy happy, but downstream_pp can be either ProxyProtocolV2 on None for UDP
-                try:
-                    # inspired by ProxyProtocolReader.read()
-                    header_data, payload_data = bytearray(), full_data
-                    while True:
-                        try:
-                            with memoryview(header_data) as view:
-                                self.downstream_pp_result = downstream_pp.unpack(view)
-                        except ProxyProtocolIncompleteError as exc:
-                            want_read = exc.want_read
-                            want_bytes = want_read.want_bytes
-                            if (
-                                want_bytes is not None
-                                and want_bytes > 0
-                                and want_bytes <= len(payload_data)
-                            ):
-                                header_data, payload_data = (
-                                    header_data + payload_data[:want_bytes],
-                                    payload_data[want_bytes:],
-                                )
-                            else:
-                                raise ValueError(
-                                    "Incomplete PROXY protocol header"
-                                ) from exc
+        if isinstance(downstream_pp, ProxyProtocolV2):
+            # make mypy happy, but downstream_pp can be either ProxyProtocolV2 on None for UDP
+            try:
+                # inspired by ProxyProtocolReader.read()
+                header_data, payload_data = bytearray(), full_data
+                while True:
+                    try:
+                        with memoryview(header_data) as view:
+                            downstream_pp_result = downstream_pp.unpack(view)
+                    except ProxyProtocolIncompleteError as exc:
+                        want_read = exc.want_read
+                        want_bytes = want_read.want_bytes
+                        if (
+                            want_bytes is not None
+                            and want_bytes > 0
+                            and want_bytes <= len(payload_data)
+                        ):
+                            header_data, payload_data = (
+                                header_data + payload_data[:want_bytes],
+                                payload_data[want_bytes:],
+                            )
                         else:
-                            break
+                            raise ValueError(
+                                "Incomplete PROXY protocol header"
+                            ) from exc
+                    else:
+                        break
 
-                    self.downstream_pp_result = downstream_pp.unpack(header_data)
-                    self.data = payload_data
-                    if is_valid_ip_port(self.downstream_pp_result.source):
-                        self.source_ip, _ = self.downstream_pp_result.source
-                except Exception as err:
-                    LOG.info(
-                        "[%s] Invalid PROXY protocol header",
-                        self.log_id,
-                    )
-                    LOG.info(err)
+                # downstream_pp_result = downstream_pp.unpack(header_data) <- should be obsolete
+                data = payload_data
+                if is_valid_ip_port(downstream_pp_result.source):
+                    source_ip, _ = downstream_pp_result.source
+            except Exception as err:
+                LOG.info(
+                    "[%s] Invalid PROXY protocol header",
+                    log_id,
+                )
+                LOG.info(err)
         else:
-            self.source_ip = ipaddress.ip_address(downstream_ip)
-            self.data = full_data
+            source_ip = ipaddress.ip_address(downstream_ip)
+            data = full_data
 
-        if self.source_ip is not None:
-            filter = self.rule.pick_upstream_and_log(self.source_ip, self.log_id)
+        if source_ip is not None:
+            filter = self.rule.pick_upstream_and_log(source_ip, log_id)
 
             if filter is not None:
                 try:
                     self.loop.create_task(
                         self.loop.create_datagram_endpoint(
-                            lambda: UpstreamProtocol(self),
+                            lambda: UpstreamProtocol(
+                                self,
+                                log_id,
+                                addr,
+                                source_ip,
+                                data,
+                                downstream_pp_result,
+                            ),
                             remote_addr=(filter.upstream.host, filter.upstream.port),
                         )
                     )
@@ -812,7 +812,7 @@ class DownstreamProtocol(asyncio.DatagramProtocol):
                     LOG.error(err.strerror)
 
     def error_received(self, err) -> None:
-        LOG.debug("[%s] Error in datagram downstream: %s", self.log_id, err)
+        LOG.debug("Error in datagram downstream: %s", err)
 
 
 class UpstreamProtocol(asyncio.DatagramProtocol):
@@ -820,10 +820,23 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
     This object controls connections coming from the upstream.
     """
 
-    def __init__(self, downstream_protocol: DownstreamProtocol):
+    def __init__(
+        self,
+        downstream_protocol: DownstreamProtocol,
+        log_id: str,
+        addr: Tuple[str, str],
+        source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None,
+        data: bytes,
+        downstream_pp_result: ProxyResult | None,
+    ):
         self.downstream_protocol = (
-            downstream_protocol  # this holds all major connection informations
+            downstream_protocol  # this holds all major connection information
         )
+        self.log_id = log_id
+        self.addr = addr
+        self.source_ip = source_ip
+        self.data = data
+        self.downstream_pp_result = downstream_pp_result
 
         self.upstream_transport: asyncio.DatagramTransport | None = None
         self.timeout_handler: asyncio.TimerHandle | None = (
@@ -839,13 +852,10 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
         # pack the PROXY protocol header if needed
         if rule.upstream_pp is not None:
             if rule.downstream_pp is not None and rule.repeat_pp:
-                if downstream_protocol.downstream_pp_result is not None:
+                if self.downstream_pp_result is not None:
                     # give for granted that the received PP is correct
                     full_data = (
-                        rule.downstream_pp.pack(
-                            downstream_protocol.downstream_pp_result
-                        )
-                        + downstream_protocol.data
+                        rule.downstream_pp.pack(self.downstream_pp_result) + self.data
                     )
                 else:
                     raise ValueError(
@@ -860,24 +870,24 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
 
                 upstream_pp_result: ProxyResultIPv4 | ProxyResultIPv6
                 protocol = socket.SOCK_DGRAM
-                if isinstance(
-                    downstream_protocol.source_ip, ipaddress.IPv4Address
-                ) and isinstance(destination_ip, ipaddress.IPv4Address):
+                if isinstance(self.source_ip, ipaddress.IPv4Address) and isinstance(
+                    destination_ip, ipaddress.IPv4Address
+                ):
                     upstream_pp_result = ProxyResultIPv4(
                         (
-                            downstream_protocol.source_ip,
-                            int(downstream_protocol.addr[1]),
+                            self.source_ip,
+                            int(self.addr[1]),
                         ),
                         (destination_ip, destination_port),
                         protocol=protocol,
                     )
-                elif isinstance(
-                    downstream_protocol.source_ip, ipaddress.IPv6Address
-                ) and isinstance(destination_ip, ipaddress.IPv6Address):
+                elif isinstance(self.source_ip, ipaddress.IPv6Address) and isinstance(
+                    destination_ip, ipaddress.IPv6Address
+                ):
                     upstream_pp_result = ProxyResultIPv6(
                         (
-                            downstream_protocol.source_ip,
-                            int(downstream_protocol.addr[1]),
+                            self.source_ip,
+                            int(self.addr[1]),
                         ),
                         (destination_ip, destination_port),
                         protocol=protocol,
@@ -886,11 +896,9 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
                     # it's 100% impossible to be here
                     raise ValueError("Incompatible source and destination ip version")
 
-                full_data = (
-                    rule.upstream_pp.pack(upstream_pp_result) + downstream_protocol.data
-                )
+                full_data = rule.upstream_pp.pack(upstream_pp_result) + self.data
         else:
-            full_data = downstream_protocol.data
+            full_data = self.data
 
         # finally proxy downstream data to upstream
         self.upstream_transport.sendto(full_data)
@@ -906,7 +914,7 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
         downstream_transport = downstream_protocol.downstream_transport
         if downstream_transport is not None:
             # 100% sure that downstream_transport is not None
-            downstream_transport.sendto(data, downstream_protocol.addr)
+            downstream_transport.sendto(data, self.addr)
         loop = self.downstream_protocol.loop
         self.timeout_handler = loop.call_later(
             self.downstream_protocol.rule.inactivity_timeout,
@@ -915,22 +923,17 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
         )
 
     def error_received(self, err) -> None:
-        LOG.debug(
-            "[%s] Error in datagram upstream: %s", self.downstream_protocol.log_id, err
-        )
+        LOG.debug("[%s] Error in datagram upstream: %s", self.log_id, err)
 
     def connection_lost(self, err) -> None:
-        LOG.debug(
-            "[%s] Upstream connection lost: %s", self.downstream_protocol.log_id, err
-        )
+        LOG.debug("[%s] Upstream connection lost: %s", self.log_id, err)
 
 
 def close_upstream_transport(upstream_protocol: UpstreamProtocol) -> None:
-    downstream_protocol = upstream_protocol.downstream_protocol
-    downstream_ip_s, downstream_port = downstream_protocol.addr
+    downstream_ip_s, downstream_port = upstream_protocol.addr
     LOG.debug(
         "[%s] Closed connection from %s:%s",
-        upstream_protocol.downstream_protocol.log_id,
+        upstream_protocol.log_id,
         downstream_ip_s,
         downstream_port,
     )
