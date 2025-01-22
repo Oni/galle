@@ -745,7 +745,6 @@ class DownstreamProtocol(asyncio.DatagramProtocol):
         Catch incoming data and extract the source ip: the real one or the one embedded in the PROXY
         protocol.
         """
-        downstream_pp_result = None
         downstream_pp = self.rule.downstream_pp
         if isinstance(downstream_pp, ProxyProtocolV2):
             # make mypy happy, but downstream_pp can be either ProxyProtocolV2 on None for UDP
@@ -785,6 +784,7 @@ class DownstreamProtocol(asyncio.DatagramProtocol):
                 )
                 LOG.info(err)
         else:
+            downstream_pp_result = None
             source_ip = ipaddress.ip_address(downstream_ip)
             data = full_data
 
