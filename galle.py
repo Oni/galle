@@ -714,6 +714,12 @@ def make_UDP_server(
 
 
 class DownstreamProtocol(asyncio.DatagramProtocol):
+    """
+    This object controls connections coming from the downstream.
+
+    The bulk of the proxying logic will be in UpstreamProtocol.
+    """
+
     def __init__(self, loop: asyncio.AbstractEventLoop, rule: Rule, general: General):
         self.loop = loop
         self.rule = rule
@@ -742,6 +748,10 @@ class DownstreamProtocol(asyncio.DatagramProtocol):
             downstream_port,
         )
 
+        """
+        Catch incoming data and extract the source ip: the real one or the one embedded in the PROXY
+        protocol.
+        """
         downstream_pp = self.rule.downstream_pp
         if downstream_pp is not None:
             if isinstance(downstream_pp, ProxyProtocolV2):
@@ -806,11 +816,19 @@ class DownstreamProtocol(asyncio.DatagramProtocol):
 
 
 class UpstreamProtocol(asyncio.DatagramProtocol):
+    """
+    This object controls connections coming from the upstream.
+    """
+
     def __init__(self, downstream_protocol: DownstreamProtocol):
-        self.downstream_protocol = downstream_protocol
+        self.downstream_protocol = (
+            downstream_protocol  # this holds all major connection informations
+        )
 
         self.upstream_transport: asyncio.DatagramTransport | None = None
-        self.timeout_handler: asyncio.TimerHandle | None = None
+        self.timeout_handler: asyncio.TimerHandle | None = (
+            None  # used for timing out this connection
+        )
 
     def connection_made(self, upstream_transport: asyncio.DatagramTransport) -> None:  # type: ignore[override]
         self.upstream_transport = upstream_transport
@@ -818,6 +836,7 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
         downstream_protocol = self.downstream_protocol
         rule = downstream_protocol.rule
 
+        # pack the PROXY protocol header if needed
         if rule.upstream_pp is not None:
             if rule.downstream_pp is not None and rule.repeat_pp:
                 if downstream_protocol.downstream_pp_result is not None:
@@ -872,9 +891,14 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
                 )
         else:
             full_data = downstream_protocol.data
+
+        # finally proxy downstream data to upstream
         self.upstream_transport.sendto(full_data)
 
     def datagram_received(self, data: bytes, addr: Tuple[str, str]) -> None:  # type: ignore[override]
+        """
+        Upstream responded: send the data back to the downstream.
+        """
         if self.timeout_handler is not None:
             self.timeout_handler.cancel()
 
