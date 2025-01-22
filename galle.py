@@ -775,7 +775,6 @@ class DownstreamProtocol(asyncio.DatagramProtocol):
                     else:
                         break
 
-                # downstream_pp_result = downstream_pp.unpack(header_data) <- should be obsolete
                 data = payload_data
                 if is_valid_ip_port(downstream_pp_result.source):
                     source_ip, _ = downstream_pp_result.source
