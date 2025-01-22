@@ -549,6 +549,7 @@ async def proxy(
                 open_writers += (upstream_writer,)
                 if rule.upstream_pp is not None:
                     if rule.downstream_pp is not None and rule.repeat_pp:
+                        # give for granted that the received PP is correct
                         upstream_writer.write(
                             rule.downstream_pp.pack(downstream_pp_result)
                         )
@@ -568,12 +569,14 @@ async def proxy(
                         and the 'source_ip' are the same.
                         """
                         upstream_pp_result: ProxyResultIPv4 | ProxyResultIPv6
+                        protocol = socket.SOCK_STREAM
                         if isinstance(source_ip, ipaddress.IPv4Address) and isinstance(
                             destination_ip, ipaddress.IPv4Address
                         ):
                             upstream_pp_result = ProxyResultIPv4(
                                 (source_ip, downstream_port),
                                 (destination_ip, destination_port),
+                                protocol=protocol,
                             )
                         elif isinstance(
                             source_ip, ipaddress.IPv6Address
@@ -581,6 +584,7 @@ async def proxy(
                             upstream_pp_result = ProxyResultIPv6(
                                 (source_ip, downstream_port),
                                 (destination_ip, destination_port),
+                                protocol=protocol,
                             )
                         else:
                             # it's 100% impossible to be here
@@ -817,6 +821,7 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
         if rule.upstream_pp is not None:
             if rule.downstream_pp is not None and rule.repeat_pp:
                 if downstream_protocol.downstream_pp_result is not None:
+                    # give for granted that the received PP is correct
                     full_data = (
                         rule.downstream_pp.pack(
                             downstream_protocol.downstream_pp_result
@@ -835,6 +840,7 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
                 destination_ip = ipaddress.ip_address(destination_ip_s)
 
                 upstream_pp_result: ProxyResultIPv4 | ProxyResultIPv6
+                protocol = socket.SOCK_DGRAM
                 if isinstance(
                     downstream_protocol.source_ip, ipaddress.IPv4Address
                 ) and isinstance(destination_ip, ipaddress.IPv4Address):
@@ -844,6 +850,7 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
                             int(downstream_protocol.addr[1]),
                         ),
                         (destination_ip, destination_port),
+                        protocol=protocol,
                     )
                 elif isinstance(
                     downstream_protocol.source_ip, ipaddress.IPv6Address
@@ -854,6 +861,7 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
                             int(downstream_protocol.addr[1]),
                         ),
                         (destination_ip, destination_port),
+                        protocol=protocol,
                     )
                 else:
                     # it's 100% impossible to be here
