@@ -708,16 +708,16 @@ def make_UDP_server(
     """
 
     return loop.create_datagram_endpoint(
-        lambda: DownstreamProtocol(loop, rule, general),
+        lambda: UDPServerProtocol(loop, rule, general),
         local_addr=("0.0.0.0", rule.port),
     )
 
 
-class DownstreamProtocol(asyncio.DatagramProtocol):
+class UDPServerProtocol(asyncio.DatagramProtocol):
     """
     This object controls connections coming from the downstream.
 
-    The bulk of the proxying logic will be in UpstreamProtocol.
+    The proxying logic will be in UDPProxyProtocol.
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop, rule: Rule, general: General):
@@ -795,7 +795,7 @@ class DownstreamProtocol(asyncio.DatagramProtocol):
                 try:
                     self.loop.create_task(
                         self.loop.create_datagram_endpoint(
-                            lambda: UpstreamProtocol(
+                            lambda: UDPProxyProtocol(
                                 self,
                                 log_id,
                                 addr,
@@ -814,22 +814,22 @@ class DownstreamProtocol(asyncio.DatagramProtocol):
         LOG.debug("Error in datagram downstream: %s", err)
 
 
-class UpstreamProtocol(asyncio.DatagramProtocol):
+class UDPProxyProtocol(asyncio.DatagramProtocol):
     """
     This object controls connections coming from the upstream.
     """
 
     def __init__(
         self,
-        downstream_protocol: DownstreamProtocol,
+        udp_server_protocol: UDPServerProtocol,
         log_id: str,
         addr: Tuple[str, str],
         source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None,
         data: bytes,
         downstream_pp_result: ProxyResult | None,
     ):
-        self.downstream_protocol = (
-            downstream_protocol  # this holds all major connection information
+        self.udp_server_protocol = (
+            udp_server_protocol  # this holds all major connection information
         )
         self.log_id = log_id
         self.addr = addr
@@ -845,8 +845,8 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
     def connection_made(self, upstream_transport: asyncio.DatagramTransport) -> None:  # type: ignore[override]
         self.upstream_transport = upstream_transport
 
-        downstream_protocol = self.downstream_protocol
-        rule = downstream_protocol.rule
+        udp_server_protocol = self.udp_server_protocol
+        rule = udp_server_protocol.rule
 
         # pack the PROXY protocol header if needed
         if rule.upstream_pp is not None:
@@ -909,14 +909,14 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
         if self.timeout_handler is not None:
             self.timeout_handler.cancel()
 
-        downstream_protocol = self.downstream_protocol
-        downstream_transport = downstream_protocol.downstream_transport
+        udp_server_protocol = self.udp_server_protocol
+        downstream_transport = udp_server_protocol.downstream_transport
         if downstream_transport is not None:
             # 100% sure that downstream_transport is not None
             downstream_transport.sendto(data, self.addr)
-        loop = self.downstream_protocol.loop
+        loop = udp_server_protocol.loop
         self.timeout_handler = loop.call_later(
-            self.downstream_protocol.rule.inactivity_timeout,
+            udp_server_protocol.rule.inactivity_timeout,
             close_upstream_transport,
             self,
         )
@@ -928,15 +928,15 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
         LOG.debug("[%s] Upstream connection lost: %s", self.log_id, err)
 
 
-def close_upstream_transport(upstream_protocol: UpstreamProtocol) -> None:
-    downstream_ip_s, downstream_port = upstream_protocol.addr
+def close_upstream_transport(udp_proxy_protocol: UDPProxyProtocol) -> None:
+    downstream_ip_s, downstream_port = udp_proxy_protocol.addr
     LOG.debug(
         "[%s] Closed connection from %s:%s",
-        upstream_protocol.log_id,
+        udp_proxy_protocol.log_id,
         downstream_ip_s,
         downstream_port,
     )
-    upstream_transport = upstream_protocol.upstream_transport
+    upstream_transport = udp_proxy_protocol.upstream_transport
     if upstream_transport is not None:
         # 100% sure that upstream_transport is not None
         upstream_transport.close()
