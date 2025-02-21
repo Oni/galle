@@ -622,7 +622,7 @@ async def proxy(
         writer.close()
         try:
             await writer.wait_closed()
-        except (ConnectionAbortedError, BrokenPipeError):
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
             pass
 
     LOG.debug(
