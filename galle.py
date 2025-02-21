@@ -668,7 +668,11 @@ async def pipe(
             )
             timeout.awake()
         except asyncio.TimeoutError:
+            # no problem, go on: check if our InactivityTimeout is ok
             pass
+        except ConnectionResetError:
+            # pipe is finished
+            break
 
         remaining_seconds = timeout.remaining
 
