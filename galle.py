@@ -661,7 +661,7 @@ async def pipe(
     timeout: InactivityTimeout,
 ) -> None:
     remaining_seconds = timeout.remaining
-    while remaining_seconds and not reader.at_eof():
+    while remaining_seconds and not reader.at_eof() and not writer.is_closing():
         try:
             writer.write(
                 await asyncio.wait_for(reader.read(BUFFER_LEN), remaining_seconds)
