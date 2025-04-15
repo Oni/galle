@@ -10,6 +10,7 @@ from typing import Dict, List, Set, TypeGuard, Tuple, Coroutine
 from functools import partial
 import socket
 import pathlib
+import subprocess
 from enum import Enum
 import time
 import json
@@ -259,7 +260,7 @@ class Rule:
         for filter in rule_config.get("filters", []):
             self.filters.append(Filter(self.name, filter, general.resolver))
 
-    async def pick_upstream_and_log(
+    def pick_upstream_and_log(
         self, source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address, log_id: str
     ) -> Filter | None:
         if is_source_ip_blacklisted(source_ip):
@@ -267,7 +268,7 @@ class Rule:
             return None
         else:
             for filter in self.filters:
-                if await filter.is_source_ip_allowed(source_ip):
+                if filter.is_source_ip_allowed(source_ip):
                     LOG.info(
                         "[%s] Real ip allowed towards '%s': %s",
                         log_id,
@@ -330,7 +331,7 @@ class Filter:
                         Address(address_or_ip_network_or_asterisk)
                     )
 
-    async def is_source_ip_allowed(
+    def is_source_ip_allowed(
         self,
         source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
     ) -> bool:
@@ -346,7 +347,7 @@ class Filter:
         # third: check by hostname (slower)
         for allowed_address in self.allowed_addresses:
             allowed_hostname = allowed_address.host
-            allowed_ip = await self.resolver.resolve(allowed_hostname)
+            allowed_ip = self.resolver.resolve(allowed_hostname)
             if source_ip == allowed_ip:
                 return True
 
@@ -373,11 +374,13 @@ class Resolver:
             str, Tuple[float, ipaddress.IPv4Address | ipaddress.IPv6Address]
         ] = {}
 
-    async def resolve(
+    def resolve(
         self, hostname: str
     ) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
         """
-        Resolve hostname using system 'nslookup' command.
+        Like async_resolve(), but sync function that uses subprocess.
+
+        Sorry for code duplication, but it can't be helped.
         """
         now = time.time()
         expiration, ip = self.cache.get(hostname, (0, None))
@@ -387,13 +390,14 @@ class Resolver:
             ip = None
 
         if ip is None:
-            proc = await asyncio.create_subprocess_shell(
+            proc = subprocess.run(
                 f"nslookup -timeout={DNS_RESOLVE_TIMEOUT} {hostname} {self.dns_address}",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
             )
 
-            stdout, stderr = await proc.communicate()
+            stdout, stderr = proc.stdout, proc.stderr
             if proc.returncode == 0:
                 """
                 The 'nslookup' command lists results as a series of 'Address:' lines. E.g.:
@@ -416,7 +420,9 @@ class Resolver:
                         ip = ipaddress.ip_address(ip_b.decode("utf-8"))
                         # store in cache + return
                         self.cache[hostname] = (now + DNS_CACHE_DURATION, ip)
+                        LOG.debug("Resolved %s to %s", hostname, ip)
                         return ip
+
                 LOG.error("Unable to parse nslookup output: %s", stdout)
                 return None
 
@@ -425,7 +431,7 @@ class Resolver:
                 return None
 
         else:
-            LOG.debug("Resolved %s to %s", hostname, ip)
+            LOG.debug("Resolved (cached) %s to %s", hostname, ip)
             return ip
 
 
@@ -601,7 +607,7 @@ async def proxy(
         source_ip = ipaddress.ip_address(downstream_ip_s)
 
     if source_ip is not None:
-        filter = await rule.pick_upstream_and_log(source_ip, log_id)
+        filter = rule.pick_upstream_and_log(source_ip, log_id)
 
         if filter is not None:
             try:
@@ -873,9 +879,7 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
             data = full_data
 
         if source_ip is not None:
-            filter = self.loop.run_until_complete(
-                self.rule.pick_upstream_and_log(source_ip, log_id)
-            )
+            filter = self.rule.pick_upstream_and_log(source_ip, log_id)
 
             if filter is not None:
                 try:
