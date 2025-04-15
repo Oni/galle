@@ -460,14 +460,6 @@ async def main() -> int:
         print(err.args[0])
         return 1
 
-    resolver = general.resolver
-    print(await resolver.resolve("www.google.com"))
-    print(await resolver.resolve("www.google.com"))
-    print(await resolver.resolve("www.google.com"))
-    print(await resolver.resolve("www.google.com"))
-
-    # return 1/0
-
     rules = []
     for rule in config.get("rules", []):
         try:
