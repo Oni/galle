@@ -2,6 +2,7 @@
     "log_level": "info",
     "inactivity_timeout": 5,
     "control_port": 5656,
+    "dns_resolver": "1.1.1.1",
     "rules": [
         {
             "port": 8081,

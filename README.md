@@ -6,6 +6,11 @@ This proxy is written in pure python.
 
 Filtering supports "PROXY protocol" to get information on the real source of the connection. Udp proxy doesn't support "PROXY protocol" version 1.
 
+The "PROXY protocol" header can also be (built and) passed to upstream.
+
+Galle also supports custom dns resolver address for filters (not upstream addresses) in case it's
+operating behind a split horizon dns.
+
 The general idea is that this proxy will listen to a user defined list of ports and will forward only whitelisted ips/hostnames to upstream. Each "whitelist" is mapped to a specific upstream.
 
 Rejected connections are dropped.

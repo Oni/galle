@@ -6,7 +6,7 @@ import asyncio
 import logging
 import signal
 import ipaddress
-from typing import List, Set, TypeGuard, Tuple, Coroutine
+from typing import Dict, List, Set, TypeGuard, Tuple, Coroutine
 from functools import partial
 import socket
 import pathlib
@@ -26,6 +26,8 @@ LOG = logging.getLogger(__name__)
 BUFFER_LEN = 1024
 UPSTREAM_CONNECTION_TIMEOUT = 5  # seconds
 CONTROL_CONNECTION_TIMEOUT = 5  # seconds
+DNS_RESOLVE_TIMEOUT = 3  # seconds
+DNS_CACHE_DURATION = 60  # seconds
 BANNED_IPS: Set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
 
 
@@ -107,6 +109,14 @@ class General:
             raise ValueError(
                 "Invalid config file: the 'control_port' must be an int"
             ) from err
+
+        try:
+            dns_resolver = config["dns_resolver"]
+        except KeyError as err:
+            raise ValueError(
+                "Invalid config file: no 'dns_resolver' option (but it can be empty)"
+            ) from err
+        self.resolver = Resolver(dns_resolver)
 
 
 class Rule:
@@ -247,9 +257,9 @@ class Rule:
 
         self.filters: List[Filter] = []
         for filter in rule_config.get("filters", []):
-            self.filters.append(Filter(self.name, filter))
+            self.filters.append(Filter(self.name, filter, general.resolver))
 
-    def pick_upstream_and_log(
+    async def pick_upstream_and_log(
         self, source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address, log_id: str
     ) -> Filter | None:
         if is_source_ip_blacklisted(source_ip):
@@ -257,7 +267,7 @@ class Rule:
             return None
         else:
             for filter in self.filters:
-                if filter.is_source_ip_allowed(source_ip):
+                if await filter.is_source_ip_allowed(source_ip):
                     LOG.info(
                         "[%s] Real ip allowed towards '%s': %s",
                         log_id,
@@ -272,7 +282,9 @@ class Rule:
 
 
 class Filter:
-    def __init__(self, name: str, filter_config: dict):
+    def __init__(self, name: str, filter_config: dict, resolver: Resolver):
+        self.resolver = resolver
+
         try:
             self.upstream = AddressWithPort(filter_config["upstream"])
         except KeyError as err:
@@ -318,7 +330,7 @@ class Filter:
                         Address(address_or_ip_network_or_asterisk)
                     )
 
-    def is_source_ip_allowed(
+    async def is_source_ip_allowed(
         self,
         source_ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
     ) -> bool:
@@ -333,22 +345,88 @@ class Filter:
 
         # third: check by hostname (slower)
         for allowed_address in self.allowed_addresses:
-            try:
-                allowed_hostname = allowed_address.host
-                allowed_ip = ipaddress.ip_address(
-                    socket.gethostbyname(allowed_hostname)
-                )
-            except socket.gaierror as err:
-                LOG.info(
-                    "Unable to resolve allowed host %s",
-                    allowed_hostname,
-                )
-                LOG.info(err.strerror)
-            else:
-                if source_ip == allowed_ip:
-                    return True
+            allowed_hostname = allowed_address.host
+            allowed_ip = await self.resolver.resolve(allowed_hostname)
+            if source_ip == allowed_ip:
+                return True
 
         return False
+
+
+class Resolver:
+    """
+    This object will resolve hostnames. Since we are resolving the same hostnames over and over, we
+    cache the results for some time.
+
+    At the moment is used for filtering incoming connections, not for resolving upstreams.
+    """
+
+    def __init__(self, dns_address: str):
+        """
+        The 'dns_address' can be empty. In that case, use the default system dns server.
+
+        An explicit 'dns_address' is necessary if the system is using some sort of custom dns
+        server, possibly with a slit horizon zone.
+        """
+        self.dns_address = dns_address
+        self.cache: Dict[
+            str, Tuple[float, ipaddress.IPv4Address | ipaddress.IPv6Address]
+        ] = {}
+
+    async def resolve(
+        self, hostname: str
+    ) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+        """
+        Resolve hostname using system 'nslookup' command.
+        """
+        now = time.time()
+        expiration, ip = self.cache.get(hostname, (0, None))
+        if ip is not None and expiration < now:
+            # Cache *was* valid, now it has expired!
+            del self.cache[hostname]
+            ip = None
+
+        if ip is None:
+            proc = await asyncio.create_subprocess_shell(
+                f"nslookup -timeout={DNS_RESOLVE_TIMEOUT} {hostname} {self.dns_address}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                """
+                The 'nslookup' command lists results as a series of 'Address:' lines. E.g.:
+                Server:         1.1.1.1
+                Address:        1.1.1.1:53
+
+                Non-authoritative answer:
+                Name:   www.google.com
+                Address: 2a00:1450:4002:809::2004
+
+                Non-authoritative answer:
+                Name:   www.google.com
+                Address: 142.251.209.4
+
+                The useful one is at the bottom.
+                """
+                for line in reversed(stdout.splitlines()):
+                    if line.startswith(b"Address:"):
+                        ip_b = line.removeprefix(b"Address:").strip()
+                        ip = ipaddress.ip_address(ip_b.decode("utf-8"))
+                        # store in cache + return
+                        self.cache[hostname] = (now + DNS_CACHE_DURATION, ip)
+                        return ip
+                LOG.error("Unable to parse nslookup output: %s", stdout)
+                return None
+
+            else:
+                LOG.error("The nslookup command returned non-0 result: %s", stderr)
+                return None
+
+        else:
+            LOG.debug("Resolved %s to %s", hostname, ip)
+            return ip
 
 
 async def main() -> int:
@@ -381,6 +459,14 @@ async def main() -> int:
     except ValueError as err:
         print(err.args[0])
         return 1
+
+    resolver = general.resolver
+    print(await resolver.resolve("www.google.com"))
+    print(await resolver.resolve("www.google.com"))
+    print(await resolver.resolve("www.google.com"))
+    print(await resolver.resolve("www.google.com"))
+
+    # return 1/0
 
     rules = []
     for rule in config.get("rules", []):
@@ -523,7 +609,7 @@ async def proxy(
         source_ip = ipaddress.ip_address(downstream_ip_s)
 
     if source_ip is not None:
-        filter = rule.pick_upstream_and_log(source_ip, log_id)
+        filter = await rule.pick_upstream_and_log(source_ip, log_id)
 
         if filter is not None:
             try:
@@ -795,7 +881,9 @@ class UDPServerProtocol(asyncio.DatagramProtocol):
             data = full_data
 
         if source_ip is not None:
-            filter = self.rule.pick_upstream_and_log(source_ip, log_id)
+            filter = self.loop.run_until_complete(
+                self.rule.pick_upstream_and_log(source_ip, log_id)
+            )
 
             if filter is not None:
                 try:
