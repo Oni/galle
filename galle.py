@@ -378,9 +378,7 @@ class Resolver:
         self, hostname: str
     ) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
         """
-        Like async_resolve(), but sync function that uses subprocess.
-
-        Sorry for code duplication, but it can't be helped.
+        Resolve hostname using system 'nslookup' command.
         """
         now = time.time()
         expiration, ip = self.cache.get(hostname, (0, None))
@@ -391,7 +389,12 @@ class Resolver:
 
         if ip is None:
             proc = subprocess.run(
-                f"nslookup -timeout={DNS_RESOLVE_TIMEOUT} {hostname} {self.dns_address}",
+                [
+                    "nslookup",
+                    f"-timeout={DNS_RESOLVE_TIMEOUT}",
+                    f"{hostname}",
+                    f"{self.dns_address}",
+                ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
